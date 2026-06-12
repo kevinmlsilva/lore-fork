@@ -70,6 +70,8 @@ We know that version control is a domain where trust is earned over time, and we
 
 Yes. Taking advantage of Lore’s extensibility, we’ve built an early desktop client, which is available now as a binary download on our [releases page](https://github.com/EpicGames/lore/releases). It isn’t open source yet — it currently depends on some proprietary components, including Epic’s internal design system — but we’re committed to open-sourcing it in the future. In the meantime, everything you can do through the desktop client and more is fully accessible via the CLI and API.
 
+*Please note:* Lore-backed UEFN projects can't yet be opened with Lore Desktop. Lore uses open source Zstandard compression, but UEFN projects previously used Oodle and aren't compatible. Support for UEFN projects will be available in an upcoming release once they have been migrated to use Zstandard.
+
 ## Where is Lore already in use at Epic?
 
 Lore, formerly called Unreal Revision Control, is the built-in version control system for UEFN (Unreal Editor for Fortnite), where creators have been using it to version their islands. It’s also seeing progressive adoption by internal Epic teams, and is being implemented as the backing store for UEFN’s cook pipeline, where it replaces traditional intermediary storage layers — eliminating redundant file transfers and significantly reducing the time between publishing changes and those changes being playable.
