@@ -3240,6 +3240,11 @@ fn collect_dirty_paths_inner(
             let child = state.node(repository.clone(), child_id).await?;
             child.walk_step(child_id, parent_node, &mut cycle)?;
 
+            if !child.is_dirty() {
+                child_node_opt = child.sibling();
+                continue;
+            }
+
             let child_name = state.node_name_clone(repository.clone(), child_id).await?;
             let child_path = parent_path.push_into_buf(&child_name).freeze();
 
@@ -3257,7 +3262,8 @@ fn collect_dirty_paths_inner(
             }
 
             let action_bits = NodeFlags::from_bits_truncate(child.flags) & NodeFlags::ActionBits;
-            if child.is_dirty() && !action_bits.is_empty() && !(skip_staged && child.is_staged()) {
+            let skip_for_staged = skip_staged && child.is_staged();
+            if !action_bits.is_empty() && !skip_for_staged {
                 paths.push(child_path.clone());
             }
 
