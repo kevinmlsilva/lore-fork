@@ -49,7 +49,7 @@ use tonic::Code;
 use tonic::Extensions;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
-use tracing::error;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -244,6 +244,17 @@ pub(crate) fn metadata_to_attribute(
     Ok(attr_map)
 }
 
+pub fn interpret_streaming_error(err: Status) -> Status {
+    // Surfaced from tonic crate src/codec/decode.rs
+    // An abrupt client error has occurred where they were streaming data then suddenly
+    // they have dropped.
+    if err.code() == Code::Internal && err.message() == "Unexpected EOF decoding stream." {
+        return Status::invalid_argument(format!("Probable client disconnect: {}", err.message()));
+    }
+
+    err
+}
+
 pub(crate) async fn send_err<T>(status: Status, tx: Sender<Result<T, Status>>) {
     let rpc_status_code = rpc_code_to_str(&status.code());
 
@@ -253,7 +264,7 @@ pub(crate) async fn send_err<T>(status: Status, tx: Sender<Result<T, Status>>) {
         info!(response = ?status, rpc_status_code, "GRPC service send_err - user error");
     }
     if let Err(e) = tx.send(Err(status)).await {
-        error!(send_error = ?e, "GRPC service error performing send_err");
+        debug!(send_error = ?e, "GRPC service error performing send_err");
     }
 }
 
