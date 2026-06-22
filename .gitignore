@@ -20,6 +20,7 @@ lore-server/config/local*.toml
 *.sln.docstates
 .vs
 .idea
+.ideas
 
 # Build results
 *_i.c
