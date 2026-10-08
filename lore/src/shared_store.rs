@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MIT
 use std::path::PathBuf;
 
-use lore_error_set::WrapInternal;
+use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::error::LoreErrorExt;
 use lore_revision::global::GlobalConfig;
+use lore_revision::instance::list_instances;
+use lore_revision::repository::RepositoryError;
 use lore_revision::shared_store::LoreSharedStoreInfoEventData;
+use lore_revision::shared_store::LoreSharedStoreListEventData;
+use lore_revision::shared_store::LoreSharedStoreListItem;
 use lore_revision::shared_store::SharedStoreError;
 use lore_revision::shared_store::find_existing_shared_store_in_dir;
+use lore_revision::shared_store::registry::SharedStoreRegistry;
+use lore_revision::util::config::SaveableConfig;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -46,8 +51,8 @@ pub struct LoreSharedStoreCreateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Shared Store Events
@@ -63,11 +68,11 @@ pub async fn create(
     dispatch_call(globals, args, callback, create_local).await
 }
 
-async fn create_local(
+fn create_local(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreCreateArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     no_repository_call(globals, callback, args, create, async move |args| {
         let path = if args.path.as_str() == "" {
             None
@@ -81,18 +86,9 @@ async fn create_local(
             .unwrap_or(raw_remote_url)
             .to_owned();
 
-        match lore_revision::shared_store::create_shared_store(
-            path,
-            remote_url,
-            args.make_default != 0,
-        )
-        .await
-        {
-            Ok(result) => Ok(result),
-            Err(e) => e.emit(),
-        }
+        lore_revision::shared_store::create_shared_store(path, remote_url, args.make_default != 0)
+            .await
     })
-    .await
 }
 
 #[repr(C)]
@@ -112,8 +108,8 @@ pub struct LoreSharedStoreInfoArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Shared Store Events
@@ -137,7 +133,7 @@ async fn info_local(
     let command = async move |_args| -> Result<(), SharedStoreError> {
         let config = GlobalConfig::load()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
 
         let mut remote_urls = Vec::new();
         let mut shared_store_paths = Vec::new();
@@ -170,6 +166,85 @@ async fn info_local(
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[handler(list_local)]
+/// Arguments for listing the registry of shared stores.
+pub struct LoreSharedStoreListArgs {
+    /// Whether to load each shared store to search for each instance using it.
+    pub include_instances: u8,
+}
+
+/// Returns information about all registered shared stores
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Shared Store Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::SharedStoreList`](crate::interface::LoreEvent::SharedStoreList) | Emitted on success with every registered shared store, and the instances using each when `include_instances` is set |
+pub async fn list(
+    globals: LoreGlobalArgs,
+    args: LoreSharedStoreListArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, list_local).await
+}
+
+async fn list_local(
+    globals: LoreGlobalArgs,
+    args: LoreSharedStoreListArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    let command = async move |_args| -> Result<(), RepositoryError> {
+        let include_instances = args.include_instances != 0;
+        let registry = SharedStoreRegistry::load()
+            .await
+            .forward::<RepositoryError>("Unable to load registry")?;
+
+        let mut stores = Vec::new();
+        for entry in registry.entries() {
+            let (ids, paths) = if include_instances {
+                let repository = entry.create_null_repository_context().await?;
+                list_instances(&repository)
+                    .await
+                    .forward::<RepositoryError>("Listing instances from repository")?
+                    .into_iter()
+                    .map(|metadata| (metadata.instance_id, metadata.path.into()))
+                    .unzip()
+            } else {
+                Default::default()
+            };
+            let per_store_data = LoreSharedStoreListItem {
+                remote_url: entry.remote_url().into(),
+                store_path: entry.path().into(),
+                instance_paths: LoreArray::from_vec(paths),
+                instance_ids: LoreArray::from_vec(ids),
+            };
+            stores.push(per_store_data);
+        }
+        LoreEvent::SharedStoreList(LoreSharedStoreListEventData {
+            stores: LoreArray::from_vec(stores),
+        })
+        .send();
+
+        Ok(())
+    };
+    no_repository_call(globals, callback, args, list, command).await
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether to automatically use the shared store.
 pub struct LoreSharedStoreSetUseAutomaticallyArgs {
@@ -188,8 +263,7 @@ pub struct LoreSharedStoreSetUseAutomaticallyArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`UrcEvent::Log`](crate::interface::UrcEvent::Log) | Diagnostic messages throughout execution |
-/// | [`UrcEvent::Error`](crate::interface::UrcEvent::Error) | Emitted when an error occurs |
-/// | [`UrcEvent::Complete`](crate::interface::UrcEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`UrcEvent::Complete`](crate::interface::UrcEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`UrcEvent::End`](crate::interface::UrcEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn set_use_automatically(
     globals: LoreGlobalArgs,
@@ -207,13 +281,16 @@ async fn set_use_automatically_local(
     let command = async move |_args| -> Result<(), SharedStoreError> {
         let (mut config, lock) = GlobalConfig::load_locked()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         if args.enabled != 0 {
             config.use_shared_store_automatically = Some(true);
         } else {
             config.use_shared_store_automatically = None;
         }
-        config.save(lock).await.internal("saving global config")?;
+        config
+            .save(lock)
+            .await
+            .forward::<SharedStoreError>("saving global config")?;
         Ok(())
     };
     no_repository_call(globals, callback, args, info, command).await

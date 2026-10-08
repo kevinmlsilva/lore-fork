@@ -37,8 +37,8 @@ pub struct LoreLockFileAcquireArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
@@ -55,11 +55,11 @@ pub async fn file_acquire(
     dispatch_call(globals, args, callback, file_acquire_local).await
 }
 
-async fn file_acquire_local(
+fn file_acquire_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -75,7 +75,6 @@ async fn file_acquire_local(
             lore_revision::lock::file::acquire::acquire(repository, options)
         },
     )
-    .await
 }
 
 pub async fn file_acquire_as_owner(
@@ -124,8 +123,8 @@ pub struct LoreLockFileStatusArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
@@ -142,11 +141,11 @@ pub async fn file_status(
     dispatch_call(globals, args, callback, file_status_local).await
 }
 
-async fn file_status_local(
+fn file_status_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileStatusArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -161,7 +160,6 @@ async fn file_status_local(
             lore_revision::lock::file::status::status(repository, options)
         },
     )
-    .await
 }
 
 /// Arguments for querying file locks on a branch, optionally filtered by owner and path.
@@ -188,8 +186,8 @@ pub struct LoreLockFileQueryArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
@@ -206,11 +204,11 @@ pub async fn file_query(
     dispatch_call(globals, args, callback, file_query_local).await
 }
 
-async fn file_query_local(
+fn file_query_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileQueryArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -226,7 +224,6 @@ async fn file_query_local(
             lore_revision::lock::file::query::query(repository, options)
         },
     )
-    .await
 }
 
 /// Arguments for releasing file locks on the given paths for a branch and owner.
@@ -255,8 +252,8 @@ pub struct LoreLockFileReleaseArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
@@ -273,11 +270,11 @@ pub async fn file_release(
     dispatch_call(globals, args, callback, file_release_local).await
 }
 
-async fn file_release_local(
+fn file_release_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -294,5 +291,4 @@ async fn file_release_local(
             lore_revision::lock::file::release::release(repository, options)
         },
     )
-    .await
 }

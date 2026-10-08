@@ -28,7 +28,7 @@ pub struct JWTUserInfo {
     pub issuer: String,
     #[serde(rename = "sub")]
     pub user_id: String,
-    pub name: String,
+    pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub is_service_account: Option<bool>,
     #[serde(rename = "exp")]
@@ -52,18 +52,37 @@ impl JWTUserInfo {
     }
 }
 
-pub async fn user_info<P>(auth_url: &str, identity: &str, token_filter: P) -> Option<UserInfo>
+pub async fn user_info<P>(
+    auth_url: &str,
+    identity: &str,
+    token_filter: P,
+    identity_token: &str,
+    access_token: &str,
+) -> Option<UserInfo>
 where
     P: FnMut(&&IdentityToken) -> bool,
 {
     lore_debug!("Get user {identity} info from {auth_url}");
 
-    let Ok(token) = crate::token_store::load_user_token(auth_url, identity, token_filter).await
+    let Ok(token) = crate::token_store::load_user_token(
+        auth_url,
+        identity,
+        token_filter,
+        identity_token,
+        access_token,
+    )
+    .await
     else {
         return None;
     };
 
     user_info_from_token(token)
+}
+
+pub fn identity_from_token(token: &str) -> String {
+    user_info_from_token(token.to_string())
+        .map(|info| info.id)
+        .unwrap_or_default()
 }
 
 pub fn insecure_decode_token(
@@ -85,7 +104,7 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
     };
     Some(UserInfo {
         id: token_data.claims.user_id.clone(),
-        name: token_data.claims.name.clone(),
+        name: token_data.claims.name.clone().unwrap_or_default(),
         token,
         preferred_username: token_data.claims.preferred_username.unwrap_or_default(),
         is_service_account: token_data.claims.is_service_account.unwrap_or_default(),
@@ -99,9 +118,13 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
 pub enum JwtUsageError {}
 
 pub fn domain_in_root_domains(domain: &str, root_domains: &[String]) -> bool {
-    root_domains
-        .iter()
-        .any(|acceptable_root| domain.ends_with(acceptable_root))
+    root_domains.iter().any(|acceptable_root| {
+        // Require a label boundary, not a raw suffix, so `epicgames.net`
+        // rejects a look-alike such as `evilepicgames.net`. A leading `.`
+        // is optional and does not change the match.
+        let apex = acceptable_root.strip_prefix('.').unwrap_or(acceptable_root);
+        domain == apex || domain.ends_with(&format!(".{apex}"))
+    })
 }
 
 pub fn verify_jwt_usage_for_remote(

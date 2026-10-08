@@ -35,7 +35,7 @@ pub enum GenerateClientReason {
 #[async_trait]
 pub trait ClientFactory: Send + Sync + 'static {
     type Output: StoreClient;
-    async fn make_client(&self) -> Result<Self::Output, ProtocolError>;
+    async fn make_client(&self, initial_cwnd: Option<u64>) -> Result<Self::Output, ProtocolError>;
 }
 
 pub struct QuicClientFactory {
@@ -45,6 +45,7 @@ pub struct QuicClientFactory {
     pub transport_config: TransportConfig,
     pub quic_max_reconnects: Option<u32>,
     pub sni_override: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 impl QuicClientFactory {
@@ -56,6 +57,7 @@ impl QuicClientFactory {
                 max_bytes_bandwidth_per_second: DEFAULT_MAX_BYTES_BANDWIDTH_PER_SEC,
                 expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
                 congestion_algorithm: CongestionAlgorithm::Bbr,
+                initial_cwnd: None,
             },
             command_behavior: CommandBehavior {
                 message_limit: DEFAULT_CLIENT_MESSAGE_LIMIT,
@@ -63,6 +65,7 @@ impl QuicClientFactory {
             },
             quic_max_reconnects: None,
             sni_override: None,
+            user_agent: None,
         }
     }
 }
@@ -71,14 +74,20 @@ impl QuicClientFactory {
 impl ClientFactory for QuicClientFactory {
     type Output = ReplicationStoreClient;
 
-    async fn make_client(&self) -> Result<Self::Output, ProtocolError> {
+    async fn make_client(&self, initial_cwnd: Option<u64>) -> Result<Self::Output, ProtocolError> {
+        let mut transport_config = self.transport_config.clone();
+        if let Some(initial_cwnd) = initial_cwnd {
+            transport_config.initial_cwnd = Some(initial_cwnd);
+        }
+
         let client = ReplicationStoreClient::connect(
             &self.remote_url,
             self.certs.clone(),
             self.sni_override.clone(),
-            self.transport_config.clone(),
+            transport_config,
             self.command_behavior.clone(),
             self.quic_max_reconnects,
+            self.user_agent.clone(),
         )
         .await?;
         Ok(client)
@@ -110,7 +119,7 @@ where
         client_factory: Arc<dyn ClientFactory<Output = ClientType>>,
         config: ClientContainerConfig,
     ) -> Result<Self, ProtocolError> {
-        let client = client_factory.make_client().await?;
+        let client = client_factory.make_client(None).await?;
         let container = ClientContainer {
             client_factory,
             generate_client_semaphore: Semaphore::new(1),
@@ -157,9 +166,15 @@ where
             return Ok(false);
         }
 
+        let mut initial_cwnd = None;
         async move {
             match reason {
-                GenerateClientReason::PeriodicRefresh => {}
+                GenerateClientReason::PeriodicRefresh => {
+                    let stats = self.connection_stats().await;
+                    if let Some(stats) = stats {
+                        initial_cwnd = Some(stats.path.cwnd);
+                    }
+                }
                 GenerateClientReason::ConnectionFailed => {
                     self.is_client_healthy.store(false, Ordering::Relaxed);
                     // the QUIC client itself already has some reconnect logic, so if it eventually
@@ -176,7 +191,7 @@ where
             let new_client = loop {
                 let make_result = self
                     .client_factory
-                    .make_client()
+                    .make_client(initial_cwnd)
                     .await
                     .inspect_err(|error| {
                         error!(?error, "Failed to regenerate client");
@@ -192,10 +207,8 @@ where
             };
 
             let mut client_write = self.client.write().await;
-            // The concrete QUIC client has some drop logic that blocks the current task on an
-            // async function - draining connections and other slow operations.
-            // We don't want this delay to hold back releasing the write lock,
-            // so avoid dropping the old client until after we have dropped the write lock
+            // Swap the new client in, then release the write lock before the old
+            // client drops so lookups aren't blocked behind the swap.
             let _old_client = std::mem::replace(&mut *client_write, new_client);
             drop(client_write);
 

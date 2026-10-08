@@ -2,6 +2,17 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use lore_base::error::AddressNotFound;
+use lore_base::error::Disconnected;
+use lore_base::error::Maintenance;
+use lore_base::error::NoRemote;
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
+use lore_base::error::NotFound;
+use lore_base::error::NotSupported;
+use lore_base::error::Oversized;
+use lore_base::error::RepositoryNotFound;
+use lore_base::error::SlowDown;
 use lore_base::error::TokenNotFound;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_credential::UserInfo;
@@ -19,10 +30,12 @@ use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreEvent;
 use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
+use lore_revision::lore::execution_context;
 use lore_revision::repository::RepositoryContext;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::call::repository_call_no_store;
 use crate::call::repository_call_read;
 use crate::call::setup_execution;
 use crate::call_delegation::dispatch_call;
@@ -31,6 +44,21 @@ use crate::interface::LoreString;
 #[error_set]
 pub enum AuthStoreError {
     TokenNotFound,
+    // Raised when the command needs a repository to resolve an auth endpoint from and
+    // was not run in one, which is a different fix for the caller than any of the below.
+    RepositoryNotFound,
+    // The remaining variants mirror `ProtocolError` so a connect failure can be
+    // forwarded whole, preserving its kind instead of collapsing to `Internal`.
+    Disconnected,
+    SlowDown,
+    NotAuthorized,
+    NotAuthenticated,
+    Maintenance,
+    NotFound,
+    AddressNotFound,
+    NoRemote,
+    NotSupported,
+    Oversized,
 }
 
 impl EventError for AuthStoreError {
@@ -43,7 +71,7 @@ impl EventError for AuthStoreError {
     }
 }
 
-/// Arguments for resolving user IDs to display names via the remote auth service.
+/// Arguments for resolving user IDs to display names via the remote user service.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
 #[handler(resolve_user_info_local)]
@@ -52,9 +80,9 @@ pub struct LoreAuthUserInfoArgs {
     pub user_ids: LoreArray<LoreString>,
 }
 
-/// Resolves user IDs to display names using the remote authentication service.
+/// Resolves user IDs to display names using the remote user service.
 ///
-/// Requires an authenticated connection. Queries the authentication service to
+/// Requires an authenticated connection. Queries the remote user service to
 /// resolve the provided user IDs to their display names.
 ///
 /// When `user_ids` is empty, falls back to [`local_user_info`] to return the
@@ -69,8 +97,8 @@ pub struct LoreAuthUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Auth Events
@@ -96,7 +124,8 @@ async fn resolve_user_info_local(
         let local_args = LoreAuthLocalUserInfoArgs {
             auth_endpoint: LoreString::default(),
             user_ids: LoreArray::default(),
-            with_token: 0,
+            with_identity_token: 0,
+            with_access_token: 0,
         };
         return local_user_info_impl(globals, local_args, callback).await;
     }
@@ -115,17 +144,64 @@ async fn resolve_user_info_impl(
     repository: Arc<RepositoryContext>,
     ids: LoreArray<LoreString>,
 ) -> Result<(), UserInfoError> {
-    lore_revision::auth::userinfo::resolve_user_info(repository, ids).await
+    lore_revision::auth::userinfo::resolve_user_info_boxed(repository, ids).await
 }
 
-fn read_repository_config(repository_path: &str) -> Option<String> {
+/// What the repository at a given path says about its remote.
+///
+/// A repository with no remote URL is distinct from no repository at all: the former is a
+/// configured state that network commands answer with `NoRemote`, the latter leaves the
+/// auth endpoint genuinely unresolvable.
+#[lore_macro::test_pub]
+enum RepositoryRemote {
+    /// No repository config could be read at this path.
+    NoRepository,
+    /// A repository is present, but no remote URL is configured for it.
+    NoRemote,
+    /// A repository is present with a remote URL configured.
+    Remote(String),
+}
+
+#[lore_macro::test_pub]
+fn read_repository_remote(repository_path: &str) -> RepositoryRemote {
+    // Presence of the tracking directory is what says a repository is here. A missing
+    // config file reads as the default config, so asking the config alone would report
+    // every path in the filesystem as a repository that merely has no remote.
+    //
+    // Resolve that directory the way the config loader does rather than joining `.lore`
+    // onto the path: a repository under a VFS keeps its tracking directory outside the
+    // working copy, and looking only for a physical one would report it as no repository
+    // at all. Loading from the directory already resolved keeps the two from diverging.
+    let Ok(dot_dir) =
+        lore_revision::repository::get_dot_lore_path(std::path::Path::new(repository_path))
+    else {
+        return RepositoryRemote::NoRepository;
+    };
+    if !dot_dir.is_dir() {
+        return RepositoryRemote::NoRepository;
+    }
+
     // If this command is invoked in a repository, load the config
-    if let Ok(repository_config) =
-        lore_revision::repository::load_repository_config(repository_path)
-    {
-        repository_config.remote_url
-    } else {
-        None
+    let Ok(repository_config) =
+        lore_revision::repository::load_repository_config_from_dot_dir(&dot_dir)
+    else {
+        return RepositoryRemote::NoRepository;
+    };
+
+    match repository_config.remote_url {
+        Some(remote_url) if !remote_url.is_empty() => RepositoryRemote::Remote(remote_url),
+        _ => RepositoryRemote::NoRemote,
+    }
+}
+
+/// The remote URL configured for the repository at `repository_path`, if it has one.
+///
+/// Collapses "no repository" and "repository with no remote" into `None` for the callers
+/// that only need a URL to hand to the transport, which reports the absence itself.
+fn configured_remote_url(repository_path: &str) -> Option<String> {
+    match read_repository_remote(repository_path) {
+        RepositoryRemote::Remote(remote_url) => Some(remote_url),
+        RepositoryRemote::NoRepository | RepositoryRemote::NoRemote => None,
     }
 }
 
@@ -173,8 +249,8 @@ pub struct LoreAuthLoginWithTokenArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Auth Events
@@ -195,37 +271,31 @@ async fn login_with_token_local(
     args: LoreAuthLoginWithTokenArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let mut status = 0;
-
     let remote_url = if !args.remote_url.is_empty() {
         args.remote_url.to_string()
     } else {
-        read_repository_config(globals.repository_path.as_str()).unwrap_or_default()
+        configured_remote_url(globals.repository_path.as_str()).unwrap_or_default()
     };
 
     let execution = setup_execution(globals, callback);
 
     let auth_url: Option<String> = args.auth_url.into();
 
-    if let Err(err) = LORE_CONTEXT
-        .scope(execution.clone(), async move {
-            login_with_token_impl(
-                remote_url.as_str(),
-                args.token.as_str(),
-                args.token_type.as_str(),
-                auth_url.as_deref(),
-            )
-            .await
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let result = async move {
+                login_with_token_impl(
+                    remote_url.as_str(),
+                    args.token.as_str(),
+                    args.token_type.as_str(),
+                    auth_url.as_deref(),
+                )
+                .await
+            }
+            .await;
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
-    {
-        execution.dispatcher.send_error(err);
-        status = 1;
-    }
-
-    execution.dispatcher.complete(status).await;
-
-    status
 }
 
 async fn login_with_token_impl(
@@ -234,7 +304,9 @@ async fn login_with_token_impl(
     token_type: &str,
     auth_url: Option<&str>,
 ) -> Result<(), LoginError> {
-    match lore_revision::auth::login::with_token(remote_url, token, token_type, auth_url).await {
+    match lore_revision::auth::login::with_token_boxed(remote_url, token, token_type, auth_url)
+        .await
+    {
         Ok(user_info) => {
             send_user_info(user_info);
             Ok(())
@@ -265,8 +337,8 @@ pub struct LoreAuthLoginInteractiveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Auth Events
@@ -274,6 +346,7 @@ pub struct LoreAuthLoginInteractiveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUrl`](crate::interface::LoreEvent::AuthUrl) | Emitted with the login URL when no_browser mode is requested (instead of opening browser) |
+/// | [`LoreEvent::AuthPending`](crate::interface::LoreEvent::AuthPending) | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires |
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication |
 pub async fn login_interactive(
     globals: LoreGlobalArgs,
@@ -288,35 +361,29 @@ async fn login_interactive_local(
     args: LoreAuthLoginInteractiveArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let mut status = 0;
-
     let remote_url = if !args.remote_url.is_empty() {
         args.remote_url.to_string()
     } else {
-        read_repository_config(globals.repository_path.as_str()).unwrap_or_default()
+        configured_remote_url(globals.repository_path.as_str()).unwrap_or_default()
     };
 
     let execution = setup_execution(globals, callback);
 
-    if let Err(err) = LORE_CONTEXT
-        .scope(execution.clone(), async move {
-            match auth::login::interactive(remote_url.as_str(), args.no_browser != 0).await {
-                Ok(user_info) => {
-                    send_user_info(user_info);
-                    Ok(())
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let result = async move {
+                match auth::login::interactive(remote_url.as_str(), args.no_browser != 0).await {
+                    Ok(user_info) => {
+                        send_user_info(user_info);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(err),
             }
+            .await;
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
-    {
-        execution.dispatcher.send_error(err);
-        status = 1;
-    }
-
-    execution.dispatcher.complete(status).await;
-
-    status
 }
 
 /// Arguments for listing all stored authentication identities across endpoints.
@@ -348,8 +415,8 @@ pub struct LoreAuthListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Auth Events
@@ -370,40 +437,34 @@ async fn list_local(
     args: LoreAuthListArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let mut status = 0;
-
     let execution = setup_execution(globals, callback);
 
-    if let Err(err) = LORE_CONTEXT
-        .scope(execution.clone(), async move {
-            let identities =
-                lore_credential::token_store::load_all_identities(args.with_token != 0)
-                    .await
-                    .forward::<AuthStoreError>("accessing token store")?;
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let result = async move {
+                let identities =
+                    lore_credential::token_store::load_all_identities(args.with_token != 0)
+                        .await
+                        .forward::<AuthStoreError>("accessing token store")?;
 
-            for identity in identities {
-                LoreEvent::AuthIdentity(LoreAuthIdentityEventData {
-                    auth_url: identity.auth_url.into(),
-                    resource: identity.resource.into(),
-                    user_id: identity.user_id.into(),
-                    authorized_domains: identity.acceptable_root_domains.join(", ").into(),
-                    expires: identity.expires_ms,
-                    token: identity.token.into(),
-                })
-                .send();
+                for identity in identities {
+                    LoreEvent::AuthIdentity(LoreAuthIdentityEventData {
+                        auth_url: identity.auth_url.into(),
+                        resource: identity.resource.into(),
+                        user_id: identity.user_id.into(),
+                        authorized_domains: identity.acceptable_root_domains.join(", ").into(),
+                        expires: identity.expires_ms,
+                        token: identity.token.into(),
+                    })
+                    .send();
+                }
+
+                Ok::<(), AuthStoreError>(())
             }
-
-            Ok::<(), AuthStoreError>(())
+            .await;
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
-    {
-        execution.dispatcher.send_error(err);
-        status = 1;
-    }
-
-    execution.dispatcher.complete(status).await;
-
-    status
 }
 
 /// Arguments for removing stored authentication and authorization tokens.
@@ -439,8 +500,8 @@ pub struct LoreAuthLogoutArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn logout(
     globals: LoreGlobalArgs,
@@ -455,43 +516,44 @@ async fn logout_local(
     args: LoreAuthLogoutArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let mut status = 0;
     let repository_path = globals.repository_path.to_string();
+    let identity = globals.identity().unwrap_or_default().to_string();
 
     let execution = setup_execution(globals, callback);
 
-    if let Err(err) = LORE_CONTEXT
-        .scope(execution.clone(), async move {
-            let auth_url = resolve_auth_endpoint(args.auth_url.as_str(), &repository_path).await?;
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let result = async move {
+                let auth_url =
+                    resolve_auth_endpoint(args.auth_url.as_str(), &repository_path, &identity)
+                        .await?;
 
-            if args.user_id.is_empty() {
-                lore_credential::token_store::remove_all_tokens_for_auth_url(&auth_url)
+                if args.user_id.is_empty() {
+                    lore_credential::token_store::remove_all_tokens_for_auth_url(&auth_url)
+                        .await
+                        .forward::<AuthStoreError>("accessing token store")?;
+                } else if args.resource.is_empty() {
+                    lore_credential::token_store::remove_user_tokens_for_auth_url(
+                        &auth_url,
+                        args.user_id.as_str(),
+                    )
                     .await
                     .forward::<AuthStoreError>("accessing token store")?;
-            } else if args.resource.is_empty() {
-                lore_credential::token_store::remove_user_tokens_for_auth_url(
-                    &auth_url,
-                    args.user_id.as_str(),
-                )
-                .await
-                .forward::<AuthStoreError>("accessing token store")?;
-            } else {
-                let store_key = format!("{}/{}", auth_url, args.resource.as_str());
-                lore_credential::token_store::remove_user_token(&store_key, args.user_id.as_str())
+                } else {
+                    let store_key = format!("{}/{}", auth_url, args.resource.as_str());
+                    lore_credential::token_store::remove_user_token(
+                        &store_key,
+                        args.user_id.as_str(),
+                    )
                     .await
                     .forward::<AuthStoreError>("accessing token store")?;
+                }
+                Ok::<(), AuthStoreError>(())
             }
-            Ok::<(), AuthStoreError>(())
+            .await;
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
-    {
-        execution.dispatcher.send_error(err);
-        status = 1;
-    }
-
-    execution.dispatcher.complete(status).await;
-
-    status
 }
 
 /// Arguments for clearing all stored authentication identities and tokens.
@@ -513,8 +575,8 @@ pub struct LoreAuthClearArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn clear(
     globals: LoreGlobalArgs,
@@ -529,26 +591,20 @@ async fn clear_local(
     _args: LoreAuthClearArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let mut status = 0;
-
     let execution = setup_execution(globals, callback);
 
-    if let Err(err) = LORE_CONTEXT
-        .scope(execution.clone(), async move {
-            lore_credential::token_store::reset_tokens()
-                .await
-                .forward::<AuthStoreError>("accessing token store")?;
-            Ok::<(), AuthStoreError>(())
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let result = async move {
+                lore_credential::token_store::reset_tokens()
+                    .await
+                    .forward::<AuthStoreError>("accessing token store")?;
+                Ok::<(), AuthStoreError>(())
+            }
+            .await;
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
-    {
-        execution.dispatcher.send_error(err);
-        status = 1;
-    }
-
-    execution.dispatcher.complete(status).await;
-
-    status
 }
 
 /// Arguments for resolving user identities from locally stored JWT tokens.
@@ -560,8 +616,13 @@ pub struct LoreAuthLocalUserInfoArgs {
     pub auth_endpoint: LoreString,
     /// User identities to resolve; empty resolves the current user
     pub user_ids: LoreArray<LoreString>,
-    /// Emit cached token details for identities with a local token
-    pub with_token: u8,
+    /// Emit cached identity token details for identities with a local token
+    #[serde(alias = "with_token")]
+    pub with_identity_token: u8,
+    /// Emit the repository's authorization (access) token. Requires running
+    /// inside a repository
+    #[serde(default)]
+    pub with_access_token: u8,
 }
 
 /// Resolves user identities to user information using locally stored JWT tokens.
@@ -574,12 +635,17 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// `auth_endpoint` is empty, resolves it from the repository's remote
 /// environment configuration.
 ///
-/// When `with_token` is set, emits `AuthUserToken` events (including the
-/// cached token string) for identities that have a locally stored token,
-/// and `AuthUserInfo` events for others.
+/// When `with_identity_token` is set, emits `AuthUserToken` events (including
+/// the cached identity token string) for identities that have a locally stored
+/// token, and `AuthUserInfo` events for others.
+///
+/// When `with_access_token` is set, the call requires a repository and
+/// additionally emits an `AuthIdentity` event carrying the repository-scoped
+/// authorization (access) token for the current user, performing a token
+/// exchange when no valid cached token exists.
 ///
 /// For remote resolution of user IDs with proper authorization, use
-/// [`resolve_user_info`] which queries the remote authentication service.
+/// [`resolve_user_info`] which queries the remote user service.
 ///
 /// # Events
 ///
@@ -590,8 +656,8 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Auth Events
@@ -599,7 +665,8 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
-/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 pub async fn local_user_info(
     globals: LoreGlobalArgs,
     args: LoreAuthLocalUserInfoArgs,
@@ -608,30 +675,50 @@ pub async fn local_user_info(
     dispatch_call(globals, args, callback, local_user_info_impl).await
 }
 
+#[lore_macro::test_pub]
 async fn resolve_auth_endpoint(
     auth_endpoint: &str,
     repository_path: &str,
+    identity: &str,
 ) -> Result<String, AuthStoreError> {
     if !auth_endpoint.is_empty() {
         return Ok(auth_endpoint.to_string());
     }
 
-    // Try to get the auth URL from the repository's remote environment
-    if let Some(remote_url) = read_repository_config(repository_path)
-        && let Ok(connection) = lore_revision::protocol::connect(
-            &remote_url,
-            "",
-            lore_revision::lore::RepositoryId::default(),
-        )
-        .await
-    {
-        let auth_url = connection.auth_url().to_string();
-        if !auth_url.is_empty() {
-            return Ok(auth_url);
+    // Forward the connect error instead of discarding it, so the real failure
+    // reaches the caller rather than collapsing into the generic error below.
+    match read_repository_remote(repository_path) {
+        RepositoryRemote::Remote(remote_url) => {
+            let connection = lore_revision::protocol::connect(
+                &remote_url,
+                identity,
+                lore_revision::lore::RepositoryId::default(),
+            )
+            .await
+            .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
+
+            let auth_url = connection.auth_url().to_string();
+            if !auth_url.is_empty() {
+                return Ok(auth_url);
+            }
+        }
+        // The repository exists and simply has no remote. Nothing is unreachable and
+        // nothing is unsupported — there is just no remote to ask for an auth endpoint.
+        RepositoryRemote::NoRemote => return Err(NoRemote.into()),
+        // Without a repository there is nowhere to read a remote from, and the fix is to
+        // run this from one (or pass an endpoint) rather than to configure anything.
+        RepositoryRemote::NoRepository => {
+            return Err(RepositoryNotFound {
+                repository: repository_path.to_string(),
+            }
+            .into());
         }
     }
 
-    Err(AuthStoreError::internal("No auth endpoint available"))
+    Err(NotSupported {
+        operation: "authentication requires a configured auth endpoint".to_string(),
+    }
+    .into())
 }
 
 async fn local_user_info_impl(
@@ -639,69 +726,96 @@ async fn local_user_info_impl(
     args: LoreAuthLocalUserInfoArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let mut status = 0;
-    let repository_path = globals.repository_path.to_string();
+    // The access token is scoped to a repository, so that variant runs as a
+    // repository call. Plain identity resolution stays repository-free.
+    if args.with_access_token != 0 {
+        return repository_call_no_store(
+            globals,
+            callback,
+            args,
+            local_user_info,
+            |repository, args| async move {
+                emit_local_user_info(&args).await?;
+                auth::userinfo::repository_access_token(repository)
+                    .await
+                    .forward::<AuthStoreError>("resolving the repository access token")
+            },
+        )
+        .await;
+    }
 
     let execution = setup_execution(globals, callback);
 
-    let include_token = args.with_token != 0;
-
-    if let Err(err) = LORE_CONTEXT
-        .scope(execution.clone(), async move {
-            let auth_endpoint =
-                resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path).await?;
-
-            let mut user_ids: Vec<String> = args
-                .user_ids
-                .as_slice()
-                .iter()
-                .map(|s| s.as_str().to_string())
-                .collect();
-
-            // When no user IDs are provided, resolve the current user
-            if user_ids.is_empty() {
-                let identities = lore_credential::token_store::load_identities(&auth_endpoint)
-                    .await
-                    .forward::<AuthStoreError>("accessing token store")?;
-                if let Some(first) = identities.into_iter().next() {
-                    user_ids.push(first);
-                }
-            }
-
-            let resolved =
-                lore_revision::auth::userinfo::resolve_local_user_info(&auth_endpoint, &user_ids)
-                    .await;
-
-            for entry in &resolved {
-                if include_token && let Some(user_info) = &entry.local_user_info {
-                    LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
-                        id: user_info.id.clone().into(),
-                        name: user_info.name.clone().into(),
-                        token: user_info.token.clone().into(),
-                        preferred_username: user_info.preferred_username.clone().into(),
-                        flag_service_account: user_info.is_service_account.into(),
-                        expires: user_info.expires,
-                    })
-                    .send();
-                    continue;
-                }
-
-                LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
-                    id: entry.id.clone().into(),
-                    name: entry.name.clone().into(),
-                })
-                .send();
-            }
-
-            Ok::<(), AuthStoreError>(())
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let result = emit_local_user_info(&args).await;
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
-    {
-        execution.dispatcher.send_error(err);
-        status = 1;
+}
+
+/// Resolves the requested identities from locally stored tokens and emits one
+/// `AuthUserInfo` or `AuthUserToken` event per identity. Runs inside an
+/// execution scope. The caller dispatches completion.
+async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), AuthStoreError> {
+    let execution = execution_context();
+    let globals = execution.globals();
+    let repository_path = globals.repository_path.to_string();
+    let identity = globals.identity().unwrap_or_default().to_string();
+    let include_identity_token = args.with_identity_token != 0;
+
+    let auth_endpoint =
+        resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity).await?;
+
+    let mut user_ids: Vec<String> = args
+        .user_ids
+        .as_slice()
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+
+    // When no user IDs are provided, resolve the current user: the
+    // identity this call acts as, which is what a supplied token
+    // names. Only without one does the store decide, since a caller
+    // working from supplied tokens may have no store at all -- and
+    // whichever identity it holds first need not be this caller.
+    if user_ids.is_empty() {
+        if !identity.is_empty() {
+            user_ids.push(identity.clone());
+        } else {
+            let identities = lore_credential::token_store::load_identities(&auth_endpoint)
+                .await
+                .forward::<AuthStoreError>("accessing token store")?;
+            if let Some(first) = identities.into_iter().next() {
+                user_ids.push(first);
+            }
+        }
     }
 
-    execution.dispatcher.complete(status).await;
+    let resolved =
+        lore_revision::auth::userinfo::resolve_local_user_info_boxed(&auth_endpoint, &user_ids)
+            .await;
 
-    status
+    for entry in &resolved {
+        if include_identity_token && let Some(user_info) = &entry.local_user_info {
+            LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
+                id: user_info.id.clone().into(),
+                name: user_info.name.clone().into(),
+                token: user_info.token.clone().into(),
+                preferred_username: user_info.preferred_username.clone().into(),
+                flag_service_account: user_info.is_service_account.into(),
+                expires: user_info.expires,
+            })
+            .send();
+            continue;
+        }
+
+        LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
+            id: entry.id.clone().into(),
+            name: entry.name.clone().into(),
+        })
+        .send();
+    }
+
+    Ok(())
 }

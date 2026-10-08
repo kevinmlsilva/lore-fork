@@ -7,11 +7,13 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::file;
+pub use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use lore_revision::file::dump::DumpError;
 use lore_revision::file::hash::HashError;
 use lore_revision::file::history::HistoryOptions;
 use lore_revision::file::info::InfoOptions;
 use lore_revision::file::obliterate::ObliterateError;
+use lore_revision::file::reset::ResetMergeSide;
 use lore_revision::file::reset::ResetOptions;
 use lore_revision::file::unstage::UnstageOptions;
 use lore_revision::file::write::WriteAddressOptions;
@@ -66,8 +68,8 @@ pub struct LoreFileInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -83,12 +85,12 @@ pub async fn info(
     dispatch_call(globals, args, callback, info_local).await
 }
 
-async fn info_local(
+fn info_local(
     globals: LoreGlobalArgs,
     args: LoreFileInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, info, info_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, info, info_impl)
 }
 
 async fn info_impl(
@@ -141,8 +143,8 @@ pub struct LoreFileDiffArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -158,12 +160,12 @@ pub async fn diff(
     dispatch_call(globals, args, callback, diff_local).await
 }
 
-async fn diff_local(
+fn diff_local(
     globals: LoreGlobalArgs,
     args: LoreFileDiffArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, diff, diff_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, diff, diff_impl)
 }
 
 async fn diff_impl(
@@ -212,8 +214,8 @@ pub struct LoreFileMetadataClearArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Metadata Events
@@ -229,11 +231,11 @@ pub async fn metadata_clear(
     dispatch_call(globals, args, callback, metadata_clear_local).await
 }
 
-async fn metadata_clear_local(
+fn metadata_clear_local(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -243,7 +245,6 @@ async fn metadata_clear_local(
             metadata::clear::clear_file(repository, &token, args.path.to_string()).await
         },
     )
-    .await
 }
 
 /// Arguments for retrieving a single metadata value for a file by key and revision.
@@ -270,8 +271,8 @@ pub struct LoreFileMetadataGetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Metadata Events
@@ -287,11 +288,11 @@ pub async fn metadata_get(
     dispatch_call(globals, args, callback, metadata_get_local).await
 }
 
-async fn metadata_get_local(
+fn metadata_get_local(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -306,7 +307,6 @@ async fn metadata_get_local(
             )
         },
     )
-    .await
 }
 
 /// Arguments for listing all metadata key/value pairs for a file at a revision.
@@ -331,8 +331,8 @@ pub struct LoreFileMetadataListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Metadata Events
@@ -348,11 +348,11 @@ pub async fn metadata_list(
     dispatch_call(globals, args, callback, metadata_list_local).await
 }
 
-async fn metadata_list_local(
+fn metadata_list_local(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -362,7 +362,6 @@ async fn metadata_list_local(
             metadata::list::list_file(repository, args.revision.into(), args.path.to_string())
         },
     )
-    .await
 }
 
 /// Arguments for setting metadata key/value pairs on one or more files.
@@ -393,8 +392,8 @@ pub struct LoreFileMetadataSetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn metadata_set(
     globals: LoreGlobalArgs,
@@ -404,11 +403,11 @@ pub async fn metadata_set(
     dispatch_call(globals, args, callback, metadata_set_local).await
 }
 
-async fn metadata_set_local(
+fn metadata_set_local(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -416,7 +415,6 @@ async fn metadata_set_local(
         metadata_set,
         |repository, token, args| async move { metadata_set_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn metadata_set_impl(
@@ -447,7 +445,7 @@ async fn metadata_set_impl(
 
     let mut encoded_values: Vec<Vec<u8>> = Vec::with_capacity(values.len());
     for (value, format) in values.iter().zip(formats.iter()) {
-        let metadata_type = (*format).into();
+        let metadata_type = *format;
         encoded_values.push(
             Metadata::decode_to_value(value.as_str(), &metadata_type).map_err(|e| {
                 lore_base::error::InvalidArguments {
@@ -515,8 +513,8 @@ pub struct LoreFileStageArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Stage Events
@@ -537,11 +535,11 @@ pub async fn stage(
     dispatch_call(globals, args, callback, stage_local).await
 }
 
-async fn stage_local(
+fn stage_local(
     globals: LoreGlobalArgs,
     args: LoreFileStageArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -559,7 +557,6 @@ async fn stage_local(
             file::stage::stage(repository, &token, args.paths, options).await
         },
     )
-    .await
 }
 
 /// Arguments for staging one or more files as merge resolutions.
@@ -582,8 +579,8 @@ pub struct LoreFileStageMergeArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Stage Events
@@ -602,29 +599,20 @@ pub async fn stage_merge(
     dispatch_call(globals, args, callback, stage_merge_local).await
 }
 
-async fn stage_merge_local(
+fn stage_merge_local(
     globals: LoreGlobalArgs,
     args: LoreFileStageMergeArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
         args,
         stage_merge,
         move |repository, token, args| async move {
-            let options = StageOptions {
-                case_change: stage::StageCaseChange::Error,
-                node_flags: node::NodeFlags::NoFlags,
-                file_id: None,
-                no_children: false,
-                scan: true,
-            };
-
-            file::stage::stage_merge(repository, &token, args.paths, options).await
+            file::stage::stage_merge(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for staging a file move from one path to another.
@@ -649,8 +637,8 @@ pub struct LoreFileStageMoveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Stage Events
@@ -669,11 +657,11 @@ pub async fn stage_move(
     dispatch_call(globals, args, callback, stage_move_local).await
 }
 
-async fn stage_move_local(
+fn stage_move_local(
     globals: LoreGlobalArgs,
     args: LoreFileStageMoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -693,7 +681,6 @@ async fn stage_move_local(
             file::stage::stage_move(repository, &token, from, to, options).await
         },
     )
-    .await
 }
 
 // ---- Dirty API ----
@@ -715,11 +702,11 @@ pub async fn dirty(
     dispatch_call(globals, args, callback, dirty_local).await
 }
 
-async fn dirty_local(
+fn dirty_local(
     globals: LoreGlobalArgs,
     args: LoreFileDirtyArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -727,7 +714,6 @@ async fn dirty_local(
         dirty,
         move |repository, _token, args| file::dirty::dirty(repository, args.paths),
     )
-    .await
 }
 
 /// Arguments for marking a file dirty-moved (relocates the staged node, no filesystem checks).
@@ -749,11 +735,11 @@ pub async fn dirty_move(
     dispatch_call(globals, args, callback, dirty_move_local).await
 }
 
-async fn dirty_move_local(
+fn dirty_move_local(
     globals: LoreGlobalArgs,
     args: LoreFileDirtyMoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -765,7 +751,6 @@ async fn dirty_move_local(
             file::dirty::dirty_move(repository, from, to)
         },
     )
-    .await
 }
 
 /// Arguments for marking a file dirty-copied (creates a new staged destination node, no filesystem checks).
@@ -787,11 +772,11 @@ pub async fn dirty_copy(
     dispatch_call(globals, args, callback, dirty_copy_local).await
 }
 
-async fn dirty_copy_local(
+fn dirty_copy_local(
     globals: LoreGlobalArgs,
     args: LoreFileDirtyCopyArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -803,7 +788,6 @@ async fn dirty_copy_local(
             file::dirty::dirty_copy(repository, from, to)
         },
     )
-    .await
 }
 
 // ---- Unstage API ----
@@ -828,8 +812,8 @@ pub struct LoreFileUnstageArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Stage Events
@@ -849,11 +833,11 @@ pub async fn unstage(
     dispatch_call(globals, args, callback, unstage_local).await
 }
 
-async fn unstage_local(
+fn unstage_local(
     globals: LoreGlobalArgs,
     args: LoreFileUnstageArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -864,7 +848,6 @@ async fn unstage_local(
             file::unstage::unstage(repository, &token, args.paths, options).await
         },
     )
-    .await
 }
 
 /// Arguments for resetting files to a revision, optionally purging untracked files.
@@ -891,8 +874,8 @@ pub struct LoreFileResetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -914,26 +897,25 @@ pub async fn reset(
     dispatch_call(globals, args, callback, reset_local).await
 }
 
-async fn reset_local(
+fn reset_local(
     globals: LoreGlobalArgs,
     args: LoreFileResetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
         args,
         reset,
-        move |repository, _token, args| {
+        move |repository, token, args| async move {
             let options = ResetOptions {
                 purge: args.purge != 0,
                 single_node: false,
             };
 
-            file::reset::reset(repository, args.paths, args.revision, options)
+            file::reset::reset(repository, &token, args.paths, args.revision, options).await
         },
     )
-    .await
 }
 
 /// Arguments for resetting files to the last merged revision on a branch.
@@ -947,6 +929,9 @@ pub struct LoreFileResetToLastMergedArgs {
     pub branch: LoreString,
     /// Purge untracked files
     pub purge: u8,
+    /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
+    #[serde(default)]
+    pub merge_side: u32,
 }
 
 /// Resets files to the state they were in at the last merged revision on a branch.
@@ -960,8 +945,8 @@ pub struct LoreFileResetToLastMergedArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -982,11 +967,11 @@ pub async fn reset_to_last_merged(
     dispatch_call(globals, args, callback, reset_to_last_merged_local).await
 }
 
-async fn reset_to_last_merged_local(
+fn reset_to_last_merged_local(
     globals: LoreGlobalArgs,
     args: LoreFileResetToLastMergedArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -998,10 +983,15 @@ async fn reset_to_last_merged_local(
                 single_node: false,
             };
 
-            file::reset::reset_to_last_merged(repository, args.paths, args.branch, options)
+            file::reset::reset_to_last_merged(
+                repository,
+                args.paths,
+                args.branch,
+                ResetMergeSide::from_u32(args.merge_side),
+                options,
+            )
         },
     )
-    .await
 }
 
 /// Arguments for writing a file to a destination by path/revision or by address.
@@ -1030,8 +1020,8 @@ pub struct LoreFileWriteArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -1109,7 +1099,8 @@ async fn write_impl(
 
         let path = args.path.to_string();
 
-        lore_revision::file::write::write_file(repository, token, path, output, options).await?;
+        lore_revision::file::write::write_file_boxed(repository, token, path, output, options)
+            .await?;
     }
 
     Ok(())
@@ -1137,8 +1128,8 @@ pub struct LoreFileObliterateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -1154,11 +1145,11 @@ pub async fn obliterate(
     dispatch_call(globals, args, callback, obliterate_local).await
 }
 
-async fn obliterate_local(
+fn obliterate_local(
     globals: LoreGlobalArgs,
     args: LoreFileObliterateArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1166,7 +1157,6 @@ async fn obliterate_local(
         obliterate,
         |repository, token, args| async move { obliterate_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn obliterate_impl(
@@ -1181,11 +1171,11 @@ async fn obliterate_impl(
             })
         })?;
 
-        lore_revision::file::obliterate::obliterate_address(repository, address).await?;
+        lore_revision::file::obliterate::obliterate_address_boxed(repository, address).await?;
     } else {
         let path = args.path.to_string();
 
-        lore_revision::file::obliterate::obliterate_file(repository, token, path).await?;
+        lore_revision::file::obliterate::obliterate_file_boxed(repository, token, path).await?;
     }
 
     Ok(())
@@ -1213,8 +1203,8 @@ pub struct LoreFileDumpArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -1230,12 +1220,12 @@ pub async fn dump(
     dispatch_call(globals, args, callback, dump_local).await
 }
 
-async fn dump_local(
+fn dump_local(
     globals: LoreGlobalArgs,
     args: LoreFileDumpArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, dump, dump_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, dump, dump_impl)
 }
 
 async fn dump_impl(
@@ -1246,11 +1236,11 @@ async fn dump_impl(
         let address =
             Address::from_str(args.address.as_str()).internal("invalid address for dump")?;
 
-        lore_revision::file::dump::dump_address(repository, address).await?;
+        lore_revision::file::dump::dump_address_boxed(repository, address).await?;
     } else {
         let path = args.path.to_string();
 
-        lore_revision::file::dump::dump_file(repository, path).await?;
+        lore_revision::file::dump::dump_file_boxed(repository, path).await?;
     }
 
     Ok(())
@@ -1276,8 +1266,8 @@ pub struct LoreFileHashArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -1293,12 +1283,12 @@ pub async fn hash(
     dispatch_call(globals, args, callback, hash_local).await
 }
 
-async fn hash_local(
+fn hash_local(
     globals: LoreGlobalArgs,
     args: LoreFileHashArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, hash, hash_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, hash, hash_impl)
 }
 
 async fn hash_impl(
@@ -1342,8 +1332,8 @@ pub struct LoreFileHistoryArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -1359,11 +1349,11 @@ pub async fn history(
     dispatch_call(globals, args, callback, history_local).await
 }
 
-async fn history_local(
+fn history_local(
     globals: LoreGlobalArgs,
     args: LoreFileHistoryArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, history, move |repository, args| {
         let path = args.path.to_string();
 
@@ -1376,5 +1366,4 @@ async fn history_local(
 
         file::history::history(repository, path, options)
     })
-    .await
 }

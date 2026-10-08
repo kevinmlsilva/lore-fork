@@ -7,8 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_base::lore_spawn_net;
+use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryServiceServer;
+use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionServiceServer;
 use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
+use lore_revision::environment::EnvironmentConfig;
+use lore_revision::notification::NotificationSender;
 use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use tonic::transport::Certificate;
@@ -17,11 +23,16 @@ use tonic::transport::Server;
 use tonic::transport::ServerTlsConfig;
 use tracing::info;
 
+use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::grpc;
+use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
+use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
 use crate::grpc::tower::tracing::LoreTracingLayer;
+use crate::hooks::HookDispatcher;
 
 // Why Tower, why?
 // Just try to make this type alias match the 'router' type in GrpcServerBuilder.
@@ -46,7 +57,10 @@ type GrpcRouter = tonic::transport::server::Router<
                     >,
                     crate::correlation::layer::CorrelationIdLayer,
                 >,
-                tower::layer::util::Identity,
+                tower::layer::util::Stack<
+                    crate::util::core_hop::CoreHopLayer,
+                    tower::layer::util::Identity,
+                >,
             >,
         >,
     >,
@@ -55,29 +69,51 @@ type GrpcRouter = tonic::transport::server::Router<
 #[derive(Debug, Default)]
 pub struct GrpcInternalServerBuilder<State>(State);
 
-pub struct WantsImmutableStore(());
+pub struct WantsComponents(());
 
-impl GrpcInternalServerBuilder<WantsImmutableStore> {
+impl GrpcInternalServerBuilder<WantsComponents> {
     pub fn new() -> Self {
-        Self(WantsImmutableStore(()))
+        Self(WantsComponents(()))
     }
 
-    pub fn with_local_immutable_store(
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_components(
         self,
+        local_immutable_store: Arc<dyn ImmutableStore>,
         immutable_store: Arc<dyn ImmutableStore>,
+        mutable_store: Arc<dyn MutableStore>,
+        notification_sender: Arc<dyn NotificationSender>,
+        hook_dispatcher: Arc<HookDispatcher>,
+        environment: EnvironmentConfig,
+        jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
-        if !immutable_store.is_local() {
+        if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
         }
 
         Ok(GrpcInternalServerBuilder(WantsTlsConfig {
-            local_immutable_store: immutable_store,
+            local_immutable_store,
+            immutable_store,
+            mutable_store,
+            notification_sender,
+            hook_dispatcher,
+            environment,
+            jwt_verifier,
+            repository_authorizer,
         }))
     }
 }
 
 pub struct WantsTlsConfig {
     local_immutable_store: Arc<dyn ImmutableStore>,
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: Arc<HookDispatcher>,
+    environment: EnvironmentConfig,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -122,6 +158,13 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
 
         Ok(GrpcInternalServerBuilder(WantsHttp2Config {
             local_immutable_store: self.0.local_immutable_store,
+            immutable_store: self.0.immutable_store,
+            mutable_store: self.0.mutable_store,
+            notification_sender: self.0.notification_sender,
+            hook_dispatcher: self.0.hook_dispatcher,
+            environment: self.0.environment,
+            jwt_verifier: self.0.jwt_verifier,
+            repository_authorizer: self.0.repository_authorizer,
             tls_config,
         }))
     }
@@ -129,6 +172,13 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
 
 pub struct WantsHttp2Config {
     local_immutable_store: Arc<dyn ImmutableStore>,
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: Arc<HookDispatcher>,
+    environment: EnvironmentConfig,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -138,6 +188,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
         http2_keep_alive_interval: Option<Duration>,
         http2_keep_alive_timeout: Option<Duration>,
         user_agent_filter: Arc<UserAgentFilter>,
+        rpc_timeout: Duration,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsAddress>> {
         let metrics_layer =
             tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(user_agent_filter));
@@ -149,7 +200,10 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
             server = server.tls_config(tls_config)?;
         }
         let tracing_levels = TraceLayerConfig::default();
-        let router = server
+        let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(crate::util::core_hop::CoreHopLayer)
             .layer(
                 CorrelationIdLayerBuilder::new()
                     .with_grpc_tracer(tracing_levels)
@@ -161,6 +215,28 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.local_immutable_store,
             )?));
 
+        router = router.add_service(ForwardedRevisionServiceServer::new(
+            LoreForwardedRevisionV1Service::new(
+                self.0.immutable_store.clone(),
+                self.0.mutable_store.clone(),
+                self.0.notification_sender.clone(),
+                self.0.hook_dispatcher.clone(),
+                rpc_timeout,
+            ),
+        ));
+
+        router = router.add_service(ForwardedRepositoryServiceServer::new(
+            LoreForwardedRepositoryV1Service::new(
+                self.0.environment,
+                self.0.jwt_verifier,
+                self.0.repository_authorizer,
+                self.0.immutable_store,
+                self.0.mutable_store,
+                self.0.hook_dispatcher,
+                rpc_timeout,
+            ),
+        ));
+
         Ok(GrpcInternalServerBuilder(WantsAddress { router }))
     }
 }
@@ -170,12 +246,37 @@ pub struct WantsAddress {
 }
 
 impl GrpcInternalServerBuilder<WantsAddress> {
+    /// Serves on the net runtime; see [`super::server::GrpcServerBuilder::serve`].
     pub async fn serve(
         self,
         addr: SocketAddr,
-        signal: impl Future<Output = ()>,
+        signal: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        self.0.router.serve_with_shutdown(addr, signal).await?;
+        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
+            .await??;
+        Ok(())
+    }
+
+    /// Serve on a socket the caller already bound; see
+    /// [`super::server::GrpcServerBuilder::serve_with_listener`], which this mirrors.
+    pub async fn serve_with_listener(
+        self,
+        listener: std::net::TcpListener,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        lore_spawn_net!(async move {
+            listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            self.0
+                .router
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    signal,
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 }

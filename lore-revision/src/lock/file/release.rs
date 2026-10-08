@@ -21,6 +21,7 @@ use crate::interface::LoreString;
 use crate::lock;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::fold_batch_results;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
@@ -102,8 +103,6 @@ impl EventError for ReleaseError {
 pub struct LoreLockFileReleaseBeginEventData {
     /// Number of release entries that follow.
     pub count: u64,
-    /// Whether this is a dry-run preview.
-    pub dry_run: u8,
     /// Whether no matching lock was found to release.
     pub not_found: u8,
 }
@@ -140,7 +139,7 @@ pub async fn release(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<ReleaseError>("Invalid branch")?;
         resolved.id
     };
 
@@ -149,7 +148,7 @@ pub async fn release(
     } else if !options.owner.is_empty() {
         let owner_id = auth::userinfo::user_id(repository.clone(), &options.owner)
             .await
-            .internal("Failed to resolve user id from user name")?;
+            .forward::<ReleaseError>("Failed to resolve user id from user name")?;
 
         Some(owner_id)
     } else {
@@ -242,7 +241,6 @@ pub async fn release(
 
         event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
             count: paths.len() as u64,
-            dry_run: 1,
             not_found: 0,
         })
         .send();
@@ -295,31 +293,22 @@ pub async fn release(
     }
     task_error?;
 
-    let mut unlocks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            unlocks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut unlocks, num_batch_success, first_batch_error) =
+        fold_batch_results(batches_results, resources_count);
+    let num_batch_failed = num_batches - num_batch_success;
 
     if num_batch_failed > 0 {
         lore_error!("Failed to lock-release {num_batch_failed} batch(es) out of {num_batches}");
     }
 
     if num_batch_success == 0 {
-        return Err(ReleaseError::internal("Failed to release the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| ReleaseError::internal("Failed to release the lock")));
     }
 
     if unlocks.is_empty() {
         event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
             count: 0,
-            dry_run: 0,
             not_found: 1,
         })
         .send();
@@ -331,7 +320,6 @@ pub async fn release(
         lore_debug!("Unlocked {} path(s)", unlocks.len());
         event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
             count: unlocks.len() as u64,
-            dry_run: 0,
             not_found: 0,
         })
         .send();

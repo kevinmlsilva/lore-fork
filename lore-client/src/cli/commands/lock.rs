@@ -6,8 +6,8 @@ use std::sync::Arc;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
-use lore::auth;
 use lore::auth::LoreAuthUserInfoArgs;
+use lore::call_delegation::run_command;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
@@ -15,9 +15,7 @@ use lore::interface::LoreLockFileAcquireArgs;
 use lore::interface::LoreLockFileReleaseArgs;
 use lore::interface::LoreLockFileStatusArgs;
 use lore::interface::LoreString;
-use lore::lock;
 use lore::lock::LoreLockFileQueryArgs;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;
@@ -105,12 +103,14 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
         branch: LoreString::from(&args.branch),
     };
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::LockFileAcquireBegin(data) if data.count > 0 => {
                 let header = if data.ignored != 0 {
                     "Lock already owned on files:"
-                } else if data.dry_run != 0 {
+                } else if globals.dry_run != 0 {
                     "Lock would be acquired on files:"
                 } else {
                     "Lock acquired on files:"
@@ -118,14 +118,14 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
                 println!("{}{}{}", CommonStyles::HEADERS, header, anstyle::Reset);
             }
             LoreEvent::LockFileAcquire(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             _ => {}
         }) as EventCallbackFn)
             .with_defaults(),
     ));
 
-    return runtime().block_on(lock::file_acquire(globals, acquire_args, callback)) as u8;
+    return run_command(globals, acquire_args.into(), callback) as u8;
 }
 
 struct LockEventData {
@@ -173,8 +173,9 @@ fn handle_lock_status(globals: LoreGlobalArgs, args: &FileLockStatusArgs) -> u8 
             .with_defaults(),
     ));
 
-    let result_status =
-        runtime().block_on(lock::file_status(globals.clone(), status_args, callback)) as u8;
+    let result_status = run_command(globals.clone(), status_args.into(), callback) as u8;
+
+    let display_path = util::cwd_relativizer(&globals);
 
     let auth_data = resolve_user_ids(globals, status_data.clone());
 
@@ -182,7 +183,12 @@ fn handle_lock_status(globals: LoreGlobalArgs, args: &FileLockStatusArgs) -> u8 
     let auth_data = auth_data.lock();
     for data in status_data.iter() {
         let owner = auth_data.get(&data.owner).unwrap_or(&data.owner);
-        println!("{} by {} on {}", data.path, owner, data.timestamp);
+        println!(
+            "{} by {} on {}",
+            display_path(&data.path),
+            owner,
+            data.timestamp
+        );
     }
 
     result_status
@@ -218,15 +224,21 @@ fn handle_lock_query(globals: LoreGlobalArgs, args: &FileLockQueryArgs) -> u8 {
             .with_defaults(),
     ));
 
-    let result_query =
-        runtime().block_on(lock::file_query(globals.clone(), query_args, callback)) as u8;
+    let result_query = run_command(globals.clone(), query_args.into(), callback) as u8;
+
+    let display_path = util::cwd_relativizer(&globals);
 
     let auth_data = resolve_user_ids(globals, query_data.clone());
     let query_data = query_data.lock();
     let auth_data = auth_data.lock();
     for data in query_data.iter() {
         let owner = auth_data.get(&data.owner).unwrap_or(&data.owner);
-        println!("{} by {} on branch {}", data.path, owner, data.branch);
+        println!(
+            "{} by {} on branch {}",
+            display_path(&data.path),
+            owner,
+            data.branch
+        );
     }
 
     result_query
@@ -244,6 +256,8 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
 
     let globals = globals.clone();
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::LockFileReleaseBegin(data) => {
@@ -254,7 +268,7 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
                         anstyle::Reset
                     );
                 } else if data.count > 0 {
-                    let header = if data.dry_run != 0 {
+                    let header = if globals.dry_run != 0 {
                         "Lock would be released on files:"
                     } else {
                         "Lock released on files:"
@@ -263,14 +277,14 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
                 }
             }
             LoreEvent::LockFileRelease(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             _ => {}
         }) as EventCallbackFn)
             .with_defaults(),
     ));
 
-    return runtime().block_on(lock::file_release(globals, release_args, callback)) as u8;
+    return run_command(globals, release_args.into(), callback) as u8;
 }
 
 pub fn handle_lock_file_commands(globals: LoreGlobalArgs, cmd: &LockFileCommands) -> u8 {
@@ -319,11 +333,7 @@ fn resolve_user_ids(
             _ => (),
         })));
 
-    let _result = runtime().block_on(auth::resolve_user_info(
-        globals.clone(),
-        auth_args,
-        callback,
-    )) as u8;
+    let _result = run_command(globals.clone(), auth_args.into(), callback) as u8;
 
     auth_data
 }

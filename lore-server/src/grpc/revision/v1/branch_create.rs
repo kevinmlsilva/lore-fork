@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::BranchPoint;
@@ -13,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tonic::Request;
@@ -21,10 +20,10 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
-use crate::grpc::extract_correlation_id;
-use crate::grpc::get_repository;
-use crate::grpc::get_user_id;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
@@ -33,6 +32,7 @@ use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
 /// Reject oversized string fields early to prevent resource exhaustion.
+#[lore_macro::test_pub]
 fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<(), Status> {
     if name.len() > branch::MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
@@ -61,46 +61,96 @@ fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<()
 /// server assigns `created` and the response's full `Branch` record.
 /// `creator` is hybrid: caller-set if permitted, otherwise the
 /// authenticated JWT identity.
+///
+/// Depending on server configuration, this request may get completely delegated to another server
+/// via `ForwardedRevisionService`
 #[tracing::instrument(name = "BranchCreate::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchCreateRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
+    forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchCreateResponse>, Status> {
-    let repository_id = get_repository(request.metadata())?;
-    let user_id = get_user_id(request.extensions());
-    let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
+    if let Some(forwarded_requests) = forwarded_requests
+        && forwarded_requests.rpc_flags().revision_branch_create
+    {
+        forward_branch_create(req, caller_context, forwarded_requests).await
+    } else {
+        branch_create_implementation(
+            req,
+            caller_context,
+            immutable_store,
+            mutable_store,
+            notification_sender,
+            hook_dispatcher,
+            instrument_provider,
+        )
+        .await
+    }
+}
 
+/// This `BranchCreateRequest` should be handled by another server
+/// and the response forwarded on to the client
+async fn forward_branch_create(
+    req: BranchCreateRequest,
+    context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<BranchCreateResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_revision_service();
+    let request = context.to_forwarded_request(req)?;
+
+    let branch_create_result = client
+        .branch_create(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = branch_create_result?;
+    Ok(response)
+}
+
+/// This `BranchCreateRequest` should be fulfilled by this server.
+pub async fn branch_create_implementation(
+    req: BranchCreateRequest,
+    context: CallerContext,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: &HookDispatcher,
+    instrument_provider: &impl InstrumentProvider,
+) -> Result<Response<BranchCreateResponse>, Status> {
     let name = req.name;
     let category = req.category;
-    let creator = req.creator.unwrap_or_else(|| user_id.clone());
+    let creator = req.creator.unwrap_or_else(|| context.user_id.clone());
     let stack: Vec<BranchPoint> = req.stack.into_iter().map(BranchPoint::from).collect();
 
     let branch = BranchId::from(req.id);
 
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+    let created = util::time::timestamp();
 
-    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
+    let execution = setup_execution(
+        module_path!(),
+        context.correlation_id.clone(),
+        context.user_id.clone(),
+    );
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
-        repository_id,
+        context.repository_id,
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
             let hook_ctx = HookContext::builder()
-                .correlation_id(correlation_id)
+                .correlation_id(&context.correlation_id)
                 .hook_point(HookPoint::BranchCreate)
-                .repository(repository_id)
-                .user(user_id)
+                .repository(context.repository_id)
+                .user(&context.user_id)
                 .branch(branch)
                 .build();
 
@@ -126,6 +176,7 @@ pub async fn handler(
                 false,
             )
             .await
+            .filter_slow_down()?
             .map_err(|err| {
                 if err.is_branch_already_exists() {
                     Status::already_exists(err.to_string())
@@ -135,10 +186,13 @@ pub async fn handler(
             })?;
 
             notification_sender
-                .branch_created(repository_id, branch_id)
+                .branch_created(context.repository_id, branch_id)
                 .await;
             hook_dispatcher.spawn_post(HookPoint::BranchCreate, hook_ctx);
 
+            // no filter_slow_down()? usage here: the branch is already created,
+            // so these response reads must not return a retryable status — the
+            // retry can only fail with BranchAlreadyExists.
             let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
                 .await
                 .warn_map_err(|err| Status::internal(err.to_string()))?;
@@ -148,8 +202,13 @@ pub async fn handler(
 
             debug!({BRANCH_ID} = %branch_id, %name, "Created branch");
 
-            let response_branch =
-                build_branch(repository, branch_id, &metadata, metadata_hash, false).await?;
+            // no filter_slow_down()? usage here: the branch exists, so an
+            // unreadable latest must not fail a create that has already
+            // committed.
+            let latest = branch::load_latest(repository, branch_id)
+                .await
+                .unwrap_or_default();
+            let response_branch = build_branch(branch_id, &metadata, metadata_hash, false, latest);
 
             instrument_provider
                 .counter("num_branches_created")
@@ -160,286 +219,4 @@ pub async fn handler(
             }))
         })
         .await
-}
-
-#[cfg(test)]
-mod test {
-    mod input_length_validation {
-        use lore_revision::branch;
-        use lore_revision::repository;
-
-        use super::super::*;
-
-        #[test]
-        fn accepts_valid_input() {
-            validate_create_input("my-branch", "feature", "alice")
-                .expect("valid input should pass");
-        }
-
-        #[test]
-        fn accepts_name_at_max_length() {
-            let name = "a".repeat(branch::MAX_NAME_LEN);
-            validate_create_input(&name, "feature", "alice")
-                .expect("name at exactly MAX_NAME_LEN should pass");
-        }
-
-        #[test]
-        fn rejects_oversized_branch_name() {
-            let long_name = "a".repeat(branch::MAX_NAME_LEN + 1);
-            let err = validate_create_input(&long_name, "feature", "alice")
-                .expect_err("should reject oversized name");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains("Branch name exceeds maximum length"));
-        }
-
-        #[test]
-        fn rejects_oversized_category() {
-            let long_cat = "a".repeat(branch::MAX_NAME_LEN + 1);
-            let err = validate_create_input("my-branch", &long_cat, "alice")
-                .expect_err("should reject oversized category");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(
-                err.message()
-                    .contains("Branch category exceeds maximum length")
-            );
-        }
-
-        #[test]
-        fn rejects_oversized_creator() {
-            let long_creator = "a".repeat(repository::MAX_NAME_LEN + 1);
-            let err = validate_create_input("my-branch", "feature", &long_creator)
-                .expect_err("should reject oversized creator");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains("Creator exceeds maximum length"));
-        }
-    }
-
-    use std::sync::Arc;
-
-    use lore_base::runtime::LORE_CONTEXT;
-    use lore_revision::lore::RepositoryId;
-    use lore_telemetry::InstrumentProvider;
-    use lore_transport::grpc::REPOSITORY_ID_KEY;
-    use opentelemetry::KeyValue;
-    use rand::random;
-    use tonic::Request;
-
-    use super::*;
-    use crate::auth::jwt::AuthorizationToken;
-    use crate::hooks::HookDispatcher;
-    use crate::notification::testing::MockNotificationSender;
-    use crate::store::test_store_create;
-
-    struct TestInstrumentProvider {}
-
-    impl InstrumentProvider for TestInstrumentProvider {
-        fn namespace(&self) -> &'static str {
-            "test"
-        }
-        fn labels(&self) -> &[KeyValue] {
-            &[]
-        }
-    }
-
-    #[tokio::test]
-    async fn create_returns_full_branch_record() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let mut notification_sender = MockNotificationSender::new();
-        notification_sender
-            .expect_branch_created()
-            .return_once(|_, _| ());
-        let notification_sender = Arc::new(notification_sender);
-        let instrument_provider = TestInstrumentProvider {};
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let mut request = Request::new(BranchCreateRequest {
-                id: branch_id.into(),
-                name: "main".into(),
-                creator: Some("alice".into()),
-                category: "default".into(),
-                stack: vec![],
-            });
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let hook_dispatcher = HookDispatcher::empty();
-            let response = handler(
-                request,
-                immutable_store.clone(),
-                mutable_store.clone(),
-                notification_sender.clone(),
-                &hook_dispatcher,
-                &instrument_provider,
-            )
-            .await
-            .expect("Request failed");
-
-            let branch = response
-                .into_inner()
-                .branch
-                .expect("response should include Branch");
-            assert_eq!(branch.name, "main");
-            assert_eq!(branch.creator, "alice");
-            assert_eq!(branch.category, "default");
-            assert!(!branch.deleted);
-            assert!(branch.created > 0);
-            assert!(!branch.id.is_empty());
-            assert!(!branch.metadata.is_empty());
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn empty_name_returns_invalid_argument() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let notification_sender = Arc::new(MockNotificationSender::new());
-        let instrument_provider = TestInstrumentProvider {};
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let mut request = Request::new(BranchCreateRequest {
-                id: branch_id.into(),
-                name: String::new(),
-                creator: Some("alice".into()),
-                category: "default".into(),
-                stack: vec![],
-            });
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let hook_dispatcher = HookDispatcher::empty();
-            let err = handler(
-                request,
-                immutable_store.clone(),
-                mutable_store.clone(),
-                notification_sender.clone(),
-                &hook_dispatcher,
-                &instrument_provider,
-            )
-            .await
-            .expect_err("empty name should fail");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn unset_creator_falls_back_to_jwt_identity() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let mut notification_sender = MockNotificationSender::new();
-        notification_sender
-            .expect_branch_created()
-            .return_once(|_, _| ());
-        let notification_sender = Arc::new(notification_sender);
-        let instrument_provider = TestInstrumentProvider {};
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let mut request = Request::new(BranchCreateRequest {
-                id: branch_id.into(),
-                name: "main".into(),
-                creator: None,
-                category: "default".into(),
-                stack: vec![],
-            });
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-            request.extensions_mut().insert(AuthorizationToken {
-                user_id: "jwt-user".into(),
-                ..AuthorizationToken::default()
-            });
-
-            let hook_dispatcher = HookDispatcher::empty();
-            let response = handler(
-                request,
-                immutable_store.clone(),
-                mutable_store.clone(),
-                notification_sender.clone(),
-                &hook_dispatcher,
-                &instrument_provider,
-            )
-            .await
-            .expect("Request failed");
-
-            let branch = response
-                .into_inner()
-                .branch
-                .expect("response should include Branch");
-            assert_eq!(branch.creator, "jwt-user");
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn duplicate_id_returns_already_exists() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let mut notification_sender = MockNotificationSender::new();
-        notification_sender
-            .expect_branch_created()
-            .return_once(|_, _| ());
-        let notification_sender = Arc::new(notification_sender);
-        let instrument_provider = TestInstrumentProvider {};
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let make_request = || {
-                let mut request = Request::new(BranchCreateRequest {
-                    id: branch_id.into(),
-                    name: "main".into(),
-                    creator: Some("alice".into()),
-                    category: "default".into(),
-                    stack: vec![],
-                });
-                request.metadata_mut().insert_bin(
-                    REPOSITORY_ID_KEY,
-                    tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-                );
-                request
-            };
-
-            let hook_dispatcher = HookDispatcher::empty();
-            handler(
-                make_request(),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                notification_sender.clone(),
-                &hook_dispatcher,
-                &instrument_provider,
-            )
-            .await
-            .expect("first create should succeed");
-
-            let err = handler(
-                make_request(),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                notification_sender.clone(),
-                &hook_dispatcher,
-                &instrument_provider,
-            )
-            .await
-            .expect_err("duplicate id should fail");
-            assert_eq!(err.code(), tonic::Code::AlreadyExists);
-        }))
-        .await;
-    }
 }

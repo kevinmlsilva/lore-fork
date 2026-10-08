@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use lore_base::error::RepositoryNotFound;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_error_set::FfiError;
+use lore_error_set::HasTrace;
 use lore_revision::event::EventError;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
@@ -16,8 +20,8 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
-use lore_revision::repository::RepositoryFormat;
 pub use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::repository::get_dot_lore_path;
 use lore_revision::util;
 
 use crate::interface::LoreEventCallback;
@@ -59,7 +63,7 @@ pub async fn repository_call_read<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError,
+    ErrT: EventError + FfiError + HasTrace,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -74,35 +78,25 @@ where
             log_command_info(&caller, &args);
             let time_start = Instant::now();
 
-            let status;
-            let mut weak_repository = None;
-            match repository::load_and_connect_with_token(
-                &repository_path,
-                RepositoryAccess::ReadOnly,
-                None,
-            )
-            .await
-            {
-                Ok(repository) => {
-                    if let Err(err) = command(repository.clone(), args).await {
-                        execution_context().dispatcher.send_error(err);
-                        status = 1;
-                    } else {
-                        status = 0;
-                    }
-                    weak_repository = Some(post_command_cleanup(repository).await);
-                }
-                Err(err) => {
-                    execution_context().dispatcher.send_error(err);
-                    status = 1;
-                }
-            }
+            let (detail, weak_repository) = 'call: {
+                let repository = match repository::load_and_connect_with_token(
+                    &repository_path,
+                    RepositoryAccess::ReadOnly,
+                    None,
+                )
+                .await
+                {
+                    Ok(repository) => repository,
+                    Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
+                };
+                let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                (detail, Some(post_command_cleanup(repository).await))
+            };
 
             check_no_lingering_repository(weak_repository);
 
             log_command_done(&caller, time_start);
-            execution_context().dispatcher.complete(status).await;
-            status
+            execution_context().dispatcher.complete(detail).await
         })
         .await
 }
@@ -122,7 +116,7 @@ pub async fn repository_call_write<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError,
+    ErrT: EventError + FfiError + HasTrace,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<RepositoryContext>, RepositoryWriteToken, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -132,43 +126,34 @@ where
         Err(status) => return status,
     };
 
-    let token = RepositoryWriteToken::acquire(&repository_path).await;
-    let context_token = token.share();
-
     LORE_CONTEXT
         .scope(execution, async move {
+            let token = RepositoryWriteToken::acquire(&repository_path).await;
+            let context_token = token.share();
+
             log_command_info(&caller, &args);
             let time_start = Instant::now();
 
-            let status;
-            let mut weak_repository = None;
-            match repository::load_and_connect_with_token(
-                &repository_path,
-                RepositoryAccess::ReadWrite,
-                Some(context_token),
-            )
-            .await
-            {
-                Ok(repository) => {
-                    if let Err(err) = command(repository.clone(), token, args).await {
-                        execution_context().dispatcher.send_error(err);
-                        status = 1;
-                    } else {
-                        status = 0;
-                    }
-                    weak_repository = Some(post_command_cleanup(repository).await);
-                }
-                Err(err) => {
-                    execution_context().dispatcher.send_error(err);
-                    status = 1;
-                }
-            }
+            let (detail, weak_repository) = 'call: {
+                let repository = match repository::load_and_connect_with_token(
+                    &repository_path,
+                    RepositoryAccess::ReadWrite,
+                    Some(context_token),
+                )
+                .await
+                {
+                    Ok(repository) => repository,
+                    Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
+                };
+                let detail =
+                    LoreErrorDetail::from_result(command(repository.clone(), token, args).await);
+                (detail, Some(post_command_cleanup(repository).await))
+            };
 
             check_no_lingering_repository(weak_repository);
 
             log_command_done(&caller, time_start);
-            execution_context().dispatcher.complete(status).await;
-            status
+            execution_context().dispatcher.complete(detail).await
         })
         .await
 }
@@ -184,7 +169,7 @@ pub async fn repository_call_no_store<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError,
+    ErrT: EventError + FfiError + HasTrace,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -199,37 +184,42 @@ where
             log_command_info(&caller, &args);
             let time_start = Instant::now();
 
-            let status;
-            let mut weak_repository = None;
-            match repository::load_and_connect_with_token(
-                &repository_path,
-                RepositoryAccess::NoStore,
-                None,
-            )
-            .await
-            {
-                Ok(repository) => {
-                    if let Err(err) = command(repository.clone(), args).await {
-                        execution_context().dispatcher.send_error(err);
-                        status = 1;
-                    } else {
-                        status = 0;
-                    }
-                    weak_repository = Some(post_command_cleanup(repository).await);
-                }
-                Err(err) => {
-                    execution_context().dispatcher.send_error(err);
-                    status = 1;
-                }
-            }
+            let (detail, weak_repository) = 'call: {
+                let repository = match repository::load_and_connect_with_token(
+                    &repository_path,
+                    RepositoryAccess::NoStore,
+                    None,
+                )
+                .await
+                {
+                    Ok(repository) => repository,
+                    Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
+                };
+                let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                (detail, Some(post_command_cleanup(repository).await))
+            };
 
             check_no_lingering_repository(weak_repository);
 
             log_command_done(&caller, time_start);
-            execution_context().dispatcher.complete(status).await;
-            status
+            execution_context().dispatcher.complete(detail).await
         })
         .await
+}
+
+/// Resolves `globals.repository_path` against the call's working directory and records the result
+/// in `globals`. Left as given when it cannot be resolved.
+pub(crate) fn resolve_repository_path(globals: &mut LoreGlobalArgs) -> PathBuf {
+    match util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(Path::new),
+    ) {
+        Ok(path) => {
+            globals.repository_path = path.display().to_string().into();
+            path
+        }
+        Err(_) => PathBuf::from(globals.repository_path.as_str()),
+    }
 }
 
 /// On `Err`, the error has already been dispatched to the callback.
@@ -237,29 +227,27 @@ async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Result<(PathBuf, Arc<ExecutionContext>), i32> {
-    let repository_path =
-        if let Ok(path) = util::path::make_absolute(globals.repository_path.as_str()) {
-            globals.repository_path = path.display().to_string().into();
-            path
-        } else {
-            PathBuf::from(globals.repository_path.as_str())
-        };
+    let repository_path = resolve_repository_path(&mut globals);
 
     let execution = setup_execution(globals, callback);
 
-    let format = RepositoryFormat::detect(&repository_path);
-    let dot_dir = format.dot_dir();
-    if !repository_path.join(dot_dir).is_dir() {
+    let dotpath = get_dot_lore_path(&repository_path).map_err(|err| err.ffi_code())?;
+    if !dotpath.is_dir() {
         let err = RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
         });
-        LORE_CONTEXT
-            .scope(execution.clone(), async {
-                execution_context().dispatcher.send_error(err);
+        // A pre-command failure reports the same status, return value, and
+        // detail as a command failure. Complete inside the execution scope so
+        // the failure log routes to the dispatcher.
+        let status = LORE_CONTEXT
+            .scope(execution, async move {
+                execution_context()
+                    .dispatcher
+                    .complete(LoreErrorDetail::from_error(&err))
+                    .await
             })
             .await;
-        execution.dispatcher.complete(1).await;
-        return Err(1);
+        return Err(status);
     }
 
     Ok((repository_path, execution))
@@ -310,7 +298,7 @@ pub async fn no_repository_call<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -323,18 +311,10 @@ where
 
             let time_start = Instant::now();
 
-            let status;
-            if let Err(err) = command(args).await {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            } else {
-                status = 0;
-            }
+            let detail = LoreErrorDetail::from_result(command(args).await);
 
             log_command_done(&caller, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete(detail).await
         })
         .await
 }

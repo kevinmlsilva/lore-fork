@@ -23,6 +23,7 @@ use crate::lock::file::release::ReleaseOptions;
 use crate::lock::file::release::release;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::fold_batch_results;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
@@ -103,8 +104,6 @@ impl EventError for AcquireError {
 pub struct LoreLockFileAcquireBeginEventData {
     /// Number of acquire entries that follow.
     pub count: u64,
-    /// Whether this is a dry-run preview.
-    pub dry_run: u8,
     /// Whether the entries that follow were already owned.
     pub ignored: u8,
 }
@@ -136,7 +135,7 @@ pub async fn acquire(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<AcquireError>("Invalid branch")?;
         resolved.id
     };
 
@@ -194,7 +193,6 @@ pub async fn acquire(
 
         event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
             count: paths.len() as u64,
-            dry_run: 1,
             ignored: 0,
         })
         .send();
@@ -212,7 +210,6 @@ pub async fn acquire(
         .await
         .forward::<AcquireError>("Unable to acquire lock while offline")?;
 
-    let resources_count = resources.len();
     let resources_values = resources.values().cloned().collect::<Vec<_>>();
     let batch_iterator = resources_values.chunks(LOCK_BATCH_SIZE);
     let num_batches = batch_iterator.len();
@@ -249,42 +246,30 @@ pub async fn acquire(
     }
     task_error?;
 
-    let mut locks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            locks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut locks, num_batch_success, first_batch_error) =
+        fold_batch_results(batches_results, resources.len());
+    let num_batch_failed = num_batches - num_batch_success;
 
     if num_batch_failed > 0 {
         lore_error!("Failed to lock-acquire {num_batch_failed} batch(es) out of {num_batches}");
-    }
 
-    if num_batch_success == 0 {
-        return Err(AcquireError::internal("Failed to acquire the lock"));
-    }
+        if num_batch_success > 0 {
+            lore_debug!("Attempting releasing partial acquired locks.");
 
-    if num_batch_success > 0 && num_batch_success < num_batches {
-        lore_debug!("Attempting releasing partial acquired locks.");
+            let options = ReleaseOptions {
+                paths: options.paths,
+                branch: options.branch,
+                owner: String::default(),
+                owner_id: String::default(),
+            };
 
-        let options = ReleaseOptions {
-            paths: options.paths,
-            branch: options.branch,
-            owner: String::default(),
-            owner_id: String::default(),
-        };
+            release(repository.clone(), options)
+                .await
+                .forward::<AcquireError>("Failed to acquire the lock")?;
+        }
 
-        release(repository.clone(), options)
-            .await
-            .forward::<AcquireError>("Failed to acquire the lock")?;
-
-        return Err(AcquireError::internal("Failed to acquire the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| AcquireError::internal("Failed to acquire the lock")));
     }
 
     locks.sort_by(|lock_a, lock_b| {
@@ -299,7 +284,6 @@ pub async fn acquire(
     if !locks.is_empty() {
         event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
             count: locks.len() as u64,
-            dry_run: 0,
             ignored: 0,
         })
         .send();
@@ -318,7 +302,6 @@ pub async fn acquire(
     if !resources.is_empty() {
         event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
             count: resources.len() as u64,
-            dry_run: 0,
             ignored: 1,
         })
         .send();

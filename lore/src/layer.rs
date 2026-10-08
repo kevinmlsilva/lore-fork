@@ -48,8 +48,8 @@ pub struct LoreLayerAddArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Layer Events
@@ -65,11 +65,11 @@ pub async fn layer_add(
     dispatch_call(globals, args, callback, layer_add_local).await
 }
 
-async fn layer_add_local(
+fn layer_add_local(
     globals: LoreGlobalArgs,
     args: LoreLayerAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -77,7 +77,6 @@ async fn layer_add_local(
         layer_add,
         |repository, token, args| async move { layer_add_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn layer_add_impl(
@@ -133,8 +132,8 @@ pub struct LoreLayerRemoveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Layer Events
@@ -150,11 +149,11 @@ pub async fn layer_remove(
     dispatch_call(globals, args, callback, layer_remove_local).await
 }
 
-async fn layer_remove_local(
+fn layer_remove_local(
     globals: LoreGlobalArgs,
     args: LoreLayerRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -162,7 +161,6 @@ async fn layer_remove_local(
         layer_remove,
         |repository, token, args| async move { layer_remove_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn layer_remove_impl(
@@ -201,8 +199,8 @@ pub struct LoreLayerListArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Layer Events
@@ -218,11 +216,11 @@ pub async fn layer_list(
     dispatch_call(globals, args, callback, layer_list_local).await
 }
 
-async fn layer_list_local(
+fn layer_list_local(
     globals: LoreGlobalArgs,
     args: LoreLayerListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -230,7 +228,6 @@ async fn layer_list_local(
         layer_list,
         move |repository, _args| list::list(repository),
     )
-    .await
 }
 
 #[repr(C)]
@@ -253,7 +250,7 @@ pub struct LoreLayerListStagedArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` |
 ///
@@ -270,20 +267,19 @@ pub async fn layer_list_staged(
     dispatch_call(globals, args, callback, layer_list_staged_local).await
 }
 
-async fn layer_list_staged_local(
+fn layer_list_staged_local(
     globals: LoreGlobalArgs,
     args: LoreLayerListStagedArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
         args,
         layer_list_staged,
         move |repository, _args| async move {
-            lore_revision::layer::list_staged(repository).await?;
+            lore_revision::layer::list_staged_boxed(repository).await?;
             Ok::<(), LayerError>(())
         },
     )
-    .await
 }

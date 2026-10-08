@@ -8,10 +8,10 @@ use std::sync::atomic::Ordering;
 
 use clap::Args;
 use clap::Subcommand;
-use lore::auth;
 use lore::auth::LoreAuthUserInfoArgs;
-use lore::branch;
+use lore::call_delegation::run_command;
 use lore::interface::Context;
+use lore::interface::FRAGMENT_SIZE_THRESHOLD;
 use lore::interface::FragmentFlags;
 use lore::interface::Hash;
 use lore::interface::LoreArray;
@@ -24,6 +24,7 @@ use lore::interface::LoreMetadata;
 use lore::interface::LoreMetadataEventData;
 use lore::interface::LoreMetadataType;
 use lore::interface::LoreRevisionAmendArgs;
+use lore::interface::LoreRevisionBisectArgs;
 use lore::interface::LoreRevisionBisectEventData;
 use lore::interface::LoreRevisionCommitArgs;
 use lore::interface::LoreRevisionCommitRevisionEventData;
@@ -43,10 +44,9 @@ use lore::interface::LoreRevisionSyncFileEventData;
 use lore::interface::LoreRevisionSyncRevisionEventData;
 use lore::interface::LoreString;
 use lore::interface::metadata;
+use lore::remote::command::LoreCommand;
 use lore::revision;
-use lore::revision::LoreRevisionBisectArgs;
 use lore::revision::LoreRevisionFindArgs;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use super::file::print_metadata;
@@ -61,6 +61,7 @@ use crate::println;
 use crate::progress_bar::ProgressBar;
 use crate::progress_bar::progress_debug;
 use crate::progress_bar::sync::apply_sync_progress_to_bar;
+use crate::stats_display;
 use crate::styling::BisectStyles;
 use crate::styling::BranchStyles;
 use crate::styling::CommonStyles;
@@ -131,7 +132,8 @@ pub struct RevisionHistoryArgs {
     #[clap(long, value_name = "branch")]
     branch: Option<String>,
 
-    /// Stop when reaching a revision created before this date (Unix timestamp)
+    /// Stop when reaching a revision created before this date (milliseconds
+    /// since the Unix epoch)
     #[clap(long, value_name = "date", hide = true)]
     date: Option<u64>,
 
@@ -164,9 +166,6 @@ pub struct RevisionInfoArgs {
 pub struct RevisionCommitArgs {
     /// Commit message
     pub message: String,
-    /// Print stats
-    #[clap(long, action)]
-    pub stats: bool,
     /// Commit only changes in this linked repository (mount path relative to repo root)
     #[clap(long, conflicts_with = "layer")]
     pub link: Option<String>,
@@ -185,16 +184,16 @@ pub struct RevisionCommitArgs {
 pub struct RevisionAmendArgs {
     /// Commit message
     pub message: String,
-    /// Print stats
-    #[clap(long, action)]
-    pub stats: bool,
 }
 
 #[derive(Args)]
 pub struct RevisionSyncArgs {
-    /// Revision hash signature to synchronize to. Can be a signature on any
-    /// branch — if the target revision is on a different branch, the current
-    /// branch is updated accordingly. Can be a partial hash signature.
+    /// Revision to synchronize to: a whole hash signature, `[branch]@<number>`,
+    /// `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target
+    /// given without it applying to the branch you are on. A revision identifies
+    /// the branch it was created on, and syncing moves onto that branch. A
+    /// branch point can also identify the child branch by naming that child
+    /// branch.
     #[clap(value_name = "revision")]
     revision: Option<String>,
 
@@ -221,6 +220,11 @@ pub struct RevisionSyncArgs {
     /// Maximum dependency traversal depth (0 means unlimited)
     #[clap(long, value_name = "depth", default_value = "0")]
     dependency_depth_limit: u32,
+
+    /// View filter file to leave the working files materialized under, changing which subset of
+    /// the repository is on disk. Without it the instance keeps the view it holds
+    #[clap(long, value_name = "file")]
+    view: Option<String>,
 }
 
 #[derive(Args)]
@@ -308,6 +312,12 @@ pub struct RevisionCherryPickArgs {
     /// Disable auto commits even if no conflicts arise from the cherry-pick.
     #[clap(long, action)]
     no_commit: bool,
+
+    /// Carry this metadata key from the picked revision onto the revision this
+    /// creates. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the cherry-pick itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -481,6 +491,7 @@ pub enum RevisionCommands {
 struct RevisionEntryDelta {
     action: String,
     path: String,
+    from_path: String,
     merged: String,
     metadata: Option<Vec<LoreMetadataEventData>>,
 }
@@ -581,8 +592,7 @@ pub fn handle_revision_history(globals: LoreGlobalArgs, args: &RevisionHistoryAr
             .with_defaults(),
     ));
 
-    let list_result =
-        runtime().block_on(revision::history(globals.clone(), list_args, callback)) as u8;
+    let list_result = run_command(globals.clone(), list_args.into(), callback) as u8;
 
     // If the revision list returned an error then don't bother resolving usernames
     if list_result != 0 {
@@ -709,13 +719,14 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
             .with_defaults(),
     ));
 
-    let info_result =
-        runtime().block_on(revision::info(globals.clone(), info_args, callback)) as u8;
+    let info_result = run_command(globals.clone(), info_args.into(), callback) as u8;
 
     // If the revision info returned an error then don't bother resolving usernames
     if info_result != 0 {
         return info_result;
     }
+
+    let display_path = util::cwd_relativizer(&globals);
 
     let auth_data = resolve_revision_user_ids(globals, info_entry_data.clone());
 
@@ -779,14 +790,26 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
                     Some('D') => FileActionStyle::DELETED,
                     _ => FileActionStyle::MODIFIED,
                 };
-                println!(
-                    "{}{}{} {} {}",
-                    action_style,
-                    delta.action,
-                    anstyle::Reset,
-                    delta.path,
-                    delta.merged
-                );
+                if delta.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {} {}",
+                        action_style,
+                        delta.action,
+                        anstyle::Reset,
+                        display_path(delta.path.as_str()),
+                        delta.merged
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {} {}",
+                        action_style,
+                        delta.action,
+                        anstyle::Reset,
+                        display_path(delta.from_path.as_str()),
+                        display_path(delta.path.as_str()),
+                        delta.merged
+                    );
+                }
                 if let Some(metadata) = delta.metadata.as_ref() {
                     for metadata in metadata.iter() {
                         print_metadata(metadata, Some(&auth_data), None);
@@ -801,130 +824,98 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
 
 const STATS_SIZE_BUCKETS: usize = 64;
 
-#[derive(Default, Clone)]
-struct FragmentStats {
-    pub total_state_count: usize,
-    pub total_fragmentlist_count: usize,
-    pub total_written_count: usize,
-    pub total_written_raw: usize,
-    pub total_written_payload: usize,
-    pub total_dedup_count: usize,
-    pub total_dedup_raw: usize,
-    pub total_dedup_payload: usize,
-    pub size_count: Vec<usize>,
+/// How the fragments a commit wrote were distributed by content size, which is
+/// the one thing the aggregate totals cannot answer: they carry sums, not a shape.
+///
+/// The only use of the per-fragment `FragmentWrite` stream; every other number in
+/// the report comes from `RevisionCommitStats`.
+#[derive(Clone)]
+struct ChunkSizeHistogram {
+    /// File-content fragments per bucket, by content size.
+    buckets: Vec<usize>,
+    /// File-content fragments counted, which each bucket is a share of.
+    total: usize,
+    /// Fragments carrying a reference list, and fragments carrying revision
+    /// state. Neither is file content, so neither is in the distribution.
+    fragmentlists: usize,
+    state_fragments: usize,
 }
 
-impl FragmentStats {
-    fn complete(&self) {
-        let total_written_count = self.total_written_count;
-        let total_written_raw = self.total_written_raw;
-        let total_written_payload = self.total_written_payload;
+impl Default for ChunkSizeHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: vec![0; STATS_SIZE_BUCKETS],
+            total: 0,
+            fragmentlists: 0,
+            state_fragments: 0,
+        }
+    }
+}
 
-        let total_dedup_count = self.total_dedup_count;
-        let total_dedup_raw = self.total_dedup_raw;
-        let total_dedup_payload = self.total_dedup_payload;
+impl ChunkSizeHistogram {
+    fn add_fragment_write(&mut self, data: &LoreFragmentWriteEventData) {
+        if (data.fragment.flags & FragmentFlags::PayloadFragmented) != 0 {
+            self.fragmentlists += 1;
+            return;
+        }
+        if (data.fragment.flags & FragmentFlags::PayloadRevisionState) != 0 {
+            self.state_fragments += 1;
+            return;
+        }
 
-        let total_fragmentlist_count = self.total_fragmentlist_count;
-        let total_state_count = self.total_state_count;
-
-        let compression_rate = if total_written_raw > 0 {
-            1.0 - (total_written_payload as f64) / (total_written_raw as f64)
-        } else {
-            0.0
-        };
-        let compression_percentage = (compression_rate * 100.0) as u32;
-
-        let dedup_rate = if total_written_count > 0 {
-            (total_dedup_count as f64) / (total_written_count as f64)
-        } else {
-            0.0
-        };
-        let dedup_count_percentage = (dedup_rate * 100.0) as u32;
-
-        let dedup_rate = if total_written_raw > 0 {
-            (total_dedup_raw as f64) / (total_written_raw as f64)
-        } else {
-            0.0
-        };
-        let dedup_raw_percentage = (dedup_rate * 100.0) as u32;
-
-        let dedup_rate = if total_written_payload > 0 {
-            (total_dedup_payload as f64) / (total_written_payload as f64)
-        } else {
-            0.0
-        };
-        let dedup_payload_percentage = (dedup_rate * 100.0) as u32;
-
-        let final_bytes = total_written_payload - total_dedup_payload;
-        let final_rate = if total_written_raw > 0 {
-            (final_bytes as f64) / (total_written_raw as f64)
-        } else {
-            0.0
-        };
-        let final_percentage = (final_rate * 100.0) as u32;
-
-        println!("Commit self");
-        println!("  Written fragments         : {total_written_count}");
-        println!("  Written raw bytes         : {total_written_raw}");
-        println!(
-            "  Written payload bytes     : {total_written_payload} ({compression_percentage}% compression)"
+        self.total += 1;
+        let share = (data.fragment.size_content as f64) / (FRAGMENT_SIZE_THRESHOLD as f64);
+        let bucket = std::cmp::min(
+            (share * (self.buckets.len() as f64)) as usize,
+            self.buckets.len() - 1,
         );
-        println!("  Deduplicated fragments    : {total_dedup_count} ({dedup_count_percentage}%)");
-        println!("  Deduplicated raw bytes    : {total_dedup_raw} ({dedup_raw_percentage}%)");
-        println!(
-            "  Deduplicated payload bytes: {total_dedup_payload} ({dedup_payload_percentage}%)"
-        );
-        println!("  Written final bytes:      : {final_bytes} ({final_percentage}%)");
-        println!("  Written list fragments    : {total_fragmentlist_count}");
-        println!("  Written state fragments   : {total_state_count}");
+        self.buckets[bucket] += 1;
+    }
 
+    fn print(&self) {
+        if self.total == 0 {
+            return;
+        }
+
+        println!(
+            "Fragment kinds: {} file, {} list, {} state",
+            self.total, self.fragmentlists, self.state_fragments
+        );
         println!("Chunk size distribution:");
-        let bucket_count = self.size_count.len();
-        let max_count = self.size_count.iter().max().cloned().unwrap_or_default();
-        for (bucket, count) in self.size_count.iter().enumerate() {
+        let bucket_count = self.buckets.len();
+        let max_count = self.buckets.iter().max().copied().unwrap_or_default();
+        for (bucket, count) in self.buckets.iter().enumerate() {
             let start_size = (((bucket as f64) / (bucket_count as f64))
-                * (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64))
-                as usize;
+                * (FRAGMENT_SIZE_THRESHOLD as f64)) as usize;
             let end_size = ((((bucket + 1) as f64) / (bucket_count as f64))
-                * (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64))
-                as usize;
+                * (FRAGMENT_SIZE_THRESHOLD as f64)) as usize;
 
-            let count_frac = ((1 + count) as f64) / (max_count as f64);
-            let count_percent = 100.0 * (*count as f64) / (total_written_count as f64);
-            let count_len = 40.0 * count_frac;
-            let stars = "*".to_string().repeat(count_len as usize);
+            let count_len = if max_count == 0 {
+                0
+            } else {
+                let count_frac = ((1 + count) as f64) / (max_count as f64);
+                (40.0 * count_frac).clamp(0.0, 40.0) as usize
+            };
+            let count_percent = 100.0 * (*count as f64) / (self.total as f64);
+            let stars = "*".repeat(count_len);
             println!(
                 "{start_size:>6} - {end_size:>6}: {stars:<40} ({count:<6}) {count_percent:.2}%"
             );
         }
     }
+}
 
-    fn add_fragment_write(&mut self, data: &LoreFragmentWriteEventData) {
-        if (data.fragment.flags & FragmentFlags::PayloadFragmented) != 0 {
-            // Fragment list
-            self.total_fragmentlist_count += 1;
-        } else if (data.fragment.flags & FragmentFlags::PayloadRevisionState) != 0 {
-            // State data
-            self.total_state_count += 1;
-        } else {
-            // File data
-            if data.deduplicated > 0 {
-                self.total_dedup_count += 1;
-                self.total_dedup_raw += data.fragment.size_content as usize;
-                self.total_dedup_payload += data.fragment.size_payload as usize;
-            }
-            self.total_written_count += 1;
-            self.total_written_raw += data.fragment.size_content as usize;
-            self.total_written_payload += data.fragment.size_payload as usize;
-
-            let size_bucket = (data.fragment.size_content as f64)
-                / (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64);
-            let size_bucket = std::cmp::min(
-                (size_bucket * (self.size_count.len() as f64)) as usize,
-                self.size_count.len() - 1,
-            );
-            self.size_count[size_bucket] += 1;
-        }
+/// Runs a listing the per-link or per-layer commit messages are resolved against. A nonzero status
+/// is the error, so the commit stops with the listing's failure rather than acting on entries it
+/// never received.
+fn run_listing(
+    globals: &LoreGlobalArgs,
+    command: impl Into<LoreCommand>,
+    callback: LoreEventCallback,
+) -> Result<(), u8> {
+    match run_command(globals.clone(), command.into(), callback) {
+        0 => Ok(()),
+        status => Err(status as u8),
     }
 }
 
@@ -966,7 +957,11 @@ fn resolve_link_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::link::list_staged(globals.clone(), discovery_callback));
+        run_listing(
+            globals,
+            lore::link::LoreLinkListStagedArgs {},
+            discovery_callback,
+        )?;
 
         let links = discovered_links.lock().clone();
         if !links.is_empty() {
@@ -1041,10 +1036,11 @@ fn resolve_link_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::link::list_staged(
-            globals.clone(),
+        run_listing(
+            globals,
+            lore::link::LoreLinkListStagedArgs {},
             validation_callback,
-        ));
+        )?;
 
         let valid_paths = discovered_paths.lock().clone();
         for path in link_paths.iter() {
@@ -1098,11 +1094,11 @@ fn resolve_layer_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::layer::layer_list_staged(
-            globals.clone(),
+        run_listing(
+            globals,
             lore::layer::LoreLayerListStagedArgs {},
             discovery_callback,
-        ));
+        )?;
 
         let layers = discovered_layers.lock().clone();
         if !layers.is_empty() {
@@ -1180,11 +1176,11 @@ fn resolve_layer_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::layer::layer_list(
-            globals.clone(),
+        run_listing(
+            globals,
             lore::layer::LoreLayerListArgs {},
             validation_callback,
-        ));
+        )?;
 
         let valid_paths = configured_layers.lock().clone();
         for path in layer_paths.iter() {
@@ -1205,11 +1201,7 @@ fn resolve_layer_messages(
 
 pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs) -> u8 {
     let dry_run = globals.dry_run();
-    let mut fragment_stats = FragmentStats::default();
-    fragment_stats.size_count.resize(STATS_SIZE_BUCKETS, 0);
-
-    let fragment_stats = Arc::new(Mutex::new(fragment_stats));
-    let print_stats = args.stats;
+    let histogram = Arc::new(Mutex::new(ChunkSizeHistogram::default()));
 
     let (link_paths, link_msgs) = match resolve_link_messages(&globals, args) {
         Ok(result) => result,
@@ -1303,20 +1295,21 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
                         data.count.file_delete_count,
                     );
                 }
+            LoreEvent::RevisionCommitStats(data) => {
+                stats_display::print_commit_file_totals(&data.files);
+                stats_display::print_fragment_totals(&data.fragments, data.files.file_bytes);
+            }
             LoreEvent::RevisionCommitRevision(data) => {
                 store_commit_data(data, commit_entry_data_clone.clone());
             }
             LoreEvent::Metadata(data) => store_metadata(data, commit_entry_data_clone.clone()),
-            LoreEvent::Complete(data)
-                if data.status == 0 && print_stats => {
-                    let stats = fragment_stats.lock();
-                    stats.complete();
-                }
-            LoreEvent::FragmentWrite(data)
-                if print_stats => {
-                    let mut stats = fragment_stats.lock();
-                    stats.add_fragment_write(data);
-                }
+            // Only the statistics level asking for per-fragment detail emits these.
+            LoreEvent::Complete(data) if data.status == 0 => {
+                histogram.lock().print();
+            }
+            LoreEvent::FragmentWrite(data) => {
+                histogram.lock().add_fragment_write(data);
+            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }
@@ -1325,8 +1318,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
             .with_defaults(),
     ));
 
-    let commit_result =
-        runtime().block_on(revision::commit(globals.clone(), commit_args, callback)) as u8;
+    let commit_result = run_command(globals.clone(), commit_args.into(), callback) as u8;
 
     // If the revision commit returned an error then don't bother resolving usernames
     if commit_result != 0 {
@@ -1356,11 +1348,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
 }
 
 pub fn handle_revision_amend(globals: LoreGlobalArgs, args: &RevisionAmendArgs) -> u8 {
-    let mut fragment_stats = FragmentStats::default();
-    fragment_stats.size_count.resize(STATS_SIZE_BUCKETS, 0);
-
-    let fragment_stats = Arc::new(Mutex::new(fragment_stats));
-    let print_stats = args.stats;
+    let histogram = Arc::new(Mutex::new(ChunkSizeHistogram::default()));
 
     let amend_args = LoreRevisionAmendArgs {
         message: LoreString::from(&args.message),
@@ -1376,13 +1364,12 @@ pub fn handle_revision_amend(globals: LoreGlobalArgs, args: &RevisionAmendArgs) 
                 store_commit_data(data, amended_entry_data_clone.clone());
             }
             LoreEvent::Metadata(data) => store_metadata(data, amended_entry_data_clone.clone()),
-            LoreEvent::Complete(data) if data.status == 0 && print_stats => {
-                let stats = fragment_stats.lock();
-                stats.complete();
+            // Only the statistics level asking for per-fragment detail emits these.
+            LoreEvent::Complete(data) if data.status == 0 => {
+                histogram.lock().print();
             }
-            LoreEvent::FragmentWrite(data) if print_stats => {
-                let mut stats = fragment_stats.lock();
-                stats.add_fragment_write(data);
+            LoreEvent::FragmentWrite(data) => {
+                histogram.lock().add_fragment_write(data);
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1392,8 +1379,7 @@ pub fn handle_revision_amend(globals: LoreGlobalArgs, args: &RevisionAmendArgs) 
             .with_defaults(),
     ));
 
-    let amend_result =
-        runtime().block_on(revision::amend(globals.clone(), amend_args, callback)) as u8;
+    let amend_result = run_command(globals.clone(), amend_args.into(), callback) as u8;
 
     // If the revision amend returned an error then don't bother resolving usernames
     if amend_result != 0 {
@@ -1427,9 +1413,20 @@ fn revision_info_display(revision: &LoreRevisionSyncRevisionEventData) -> String
     )
 }
 
+fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
+    if remote_available != 0 && remote_authorized == 0 {
+        println!(
+            "{}Remote reachable but could not read remote revision (not authorized or unavailable), synchronizing against local history only{}",
+            LogStyles::WARNING,
+            anstyle::Reset,
+        );
+    }
+}
+
 pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: bool) {
     match event {
         LoreEvent::RevisionSyncTarget(data) if data.source_revision == data.target_revision => {
+            print_sync_remote_warning(data.remote_available, data.remote_authorized);
             if data.is_latest != 0 {
                 println!(
                     "Already on branch {} latest revision {} -> {}",
@@ -1443,6 +1440,7 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
             }
         }
         LoreEvent::RevisionSyncTarget(data) => {
+            print_sync_remote_warning(data.remote_available, data.remote_authorized);
             if !data.remote.is_empty() {
                 println!("Sync from remote {}", data.remote);
             }
@@ -1485,19 +1483,7 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
                 println!("  {}({id}) {path}{}", LogStyles::WARNING, anstyle::Reset);
             }
         }
-        LoreEvent::RevisionResolve(data) => {
-            if data.revision_number != 0 {
-                println!(
-                    "Resolving revision number {} on branch {}",
-                    data.revision_number, data.branch
-                );
-            } else {
-                println!(
-                    "Resolving revision partial hash signature {}",
-                    data.revision
-                );
-            }
-        }
+        LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
         LoreEvent::Complete(_) if !debug => {
             println!();
         }
@@ -1529,6 +1515,7 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        view: args.view.as_ref().into(),
     };
 
     let progress_bar = ProgressBar::new(0);
@@ -1540,7 +1527,7 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::sync(globals, sync_args, callback)) as u8;
+    return run_command(globals, sync_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_bisect(globals: LoreGlobalArgs, args: &RevisionBisectArgs) -> u8 {
@@ -1595,7 +1582,7 @@ pub fn handle_revision_bisect(globals: LoreGlobalArgs, args: &RevisionBisectArgs
         }) as EventCallbackFn)
             .with_defaults(),
     ));
-    runtime().block_on(revision::bisect(globals, bisect_args, callback)) as u8
+    run_command(globals, bisect_args.into(), callback) as u8
 }
 
 pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) -> u8 {
@@ -1609,16 +1596,29 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
 
     let _pager = Pager::new();
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionDiffFile(data) => {
-                println!(
-                    "{}{}{} {}",
-                    FileActionStyle::from_action(data.action),
-                    data.action_as_string_short(),
-                    anstyle::Reset,
-                    data.path.as_str()
-                );
+                if data.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.path.as_str())
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.from_path.as_str()),
+                        display_path(data.path.as_str())
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -1629,7 +1629,7 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::diff(globals, diff_args, callback)) as u8;
+    return run_command(globals, diff_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_find(globals: LoreGlobalArgs, args: &RevisionFindArgs) -> u8 {
@@ -1664,7 +1664,7 @@ pub fn handle_revision_find(globals: LoreGlobalArgs, args: &RevisionFindArgs) ->
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::find(globals, find_args, callback)) as u8;
+    return run_command(globals, find_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreArgs) -> u8 {
@@ -1674,6 +1674,8 @@ pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreAr
 
     let debug = progress_debug();
     let progress_bar = ProgressBar::new(0);
+
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -1685,7 +1687,7 @@ pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreAr
                 );
             }
             LoreEvent::RevisionRestoreFile(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             LoreEvent::RevisionRestoreFragmentBegin(data) if data.fragments > 0 => {
                 println!("Query {} fragment(s)", data.fragments);
@@ -1722,7 +1724,7 @@ pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreAr
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::restore(globals, restore_args, callback)) as u8;
+    return run_command(globals, restore_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherryPickArgs) -> u8 {
@@ -1747,10 +1749,15 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
             revision: LoreString::from(&args.revision),
             message: LoreString::from(&args.message),
             no_commit: args.no_commit as u8,
+            inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+                &args.inherit_metadata,
+            )),
         };
 
         let debug = progress_debug();
         let progress_bar = ProgressBar::new(0);
+
+        let display_path = util::cwd_relativizer(&globals);
 
         let callback = output_formatter().unwrap_or(Some(
             (Box::new(move |event: &LoreEvent| match event {
@@ -1779,7 +1786,12 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
                     );
                 }
                 LoreEvent::CherryPickConflictFile(data) => {
-                    println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                    println!(
+                        "{}{}{}",
+                        BranchStyles::CONFLICT,
+                        display_path(data.path.as_str()),
+                        anstyle::Reset
+                    );
                 }
                 LoreEvent::Complete(_) => {}
                 LoreEvent::Maintenance(data) => {
@@ -1789,7 +1801,7 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
             }) as EventCallbackFn)
                 .with_defaults(),
         ));
-        runtime().block_on(revision::cherry_pick(globals, cherry_pick_args, callback)) as u8
+        run_command(globals, cherry_pick_args.into(), callback) as u8
     }
 }
 
@@ -1825,11 +1837,7 @@ fn handle_revision_cherry_pick_abort(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_abort(
-        globals,
-        cherry_pick_abort_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_abort_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_unresolve(
@@ -1841,6 +1849,7 @@ fn handle_revision_cherry_pick_unresolve(
     let cherry_pick_unresolve_args = revision::LoreRevisionCherryPickUnresolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -1856,7 +1865,7 @@ fn handle_revision_cherry_pick_unresolve(
                 println!(
                     "{}{}{}",
                     BranchStyles::CONFLICT,
-                    data.path.as_str(),
+                    display_path(data.path.as_str()),
                     anstyle::Reset
                 );
 
@@ -1876,11 +1885,7 @@ fn handle_revision_cherry_pick_unresolve(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_unresolve(
-        globals,
-        cherry_pick_unresolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_unresolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_restart(
@@ -1902,11 +1907,7 @@ fn handle_revision_cherry_pick_restart(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_restart(
-        globals,
-        cherry_pick_restart_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_restart_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_resolve(
@@ -1942,6 +1943,7 @@ fn handle_revision_cherry_pick_resolve_impl(
     let cherry_pick_resolve_args = revision::LoreRevisionCherryPickResolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -1954,7 +1956,7 @@ fn handle_revision_cherry_pick_resolve_impl(
                         anstyle::Reset
                     );
                 }
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
@@ -1972,11 +1974,7 @@ fn handle_revision_cherry_pick_resolve_impl(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_resolve(
-        globals,
-        cherry_pick_resolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_resolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_resolve_mine(
@@ -1998,11 +1996,7 @@ fn handle_revision_cherry_pick_resolve_mine(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_resolve_mine(
-        globals,
-        cherry_pick_resolve_mine_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_resolve_mine_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_resolve_theirs(
@@ -2025,11 +2019,7 @@ fn handle_revision_cherry_pick_resolve_theirs(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_resolve_theirs(
-        globals,
-        cherry_pick_resolve_theirs_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_resolve_theirs_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs) -> u8 {
@@ -2059,6 +2049,8 @@ pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs
         let debug = progress_debug();
         let progress_bar = ProgressBar::new(0);
 
+        let display_path = util::cwd_relativizer(&globals);
+
         let callback = output_formatter().unwrap_or(Some(
             (Box::new(move |event: &LoreEvent| match event {
                 LoreEvent::RevertStartBegin(_data) => {}
@@ -2082,10 +2074,20 @@ pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs
                     );
                 }
                 LoreEvent::RevertConflictFile(data) => {
-                    println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                    println!(
+                        "{}{}{}",
+                        BranchStyles::CONFLICT,
+                        display_path(data.path.as_str()),
+                        anstyle::Reset
+                    );
                 }
                 LoreEvent::RevertUnresolveFile(data) => {
-                    println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                    println!(
+                        "{}{}{}",
+                        BranchStyles::CONFLICT,
+                        display_path(data.path.as_str()),
+                        anstyle::Reset
+                    );
                 }
                 LoreEvent::Complete(_) => {}
                 LoreEvent::Maintenance(data) => {
@@ -2095,7 +2097,7 @@ pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs
             }) as EventCallbackFn)
                 .with_defaults(),
         ));
-        runtime().block_on(revision::revert(globals, revert_args, callback)) as u8
+        run_command(globals, revert_args.into(), callback) as u8
     }
 }
 
@@ -2131,7 +2133,7 @@ fn handle_revision_revert_abort(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_abort(globals, revert_abort_args, callback)) as u8;
+    return run_command(globals, revert_abort_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_unresolve(
@@ -2143,6 +2145,7 @@ fn handle_revision_revert_unresolve(
     let revert_unresolve_args = revision::LoreRevisionRevertUnresolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -2154,7 +2157,7 @@ fn handle_revision_revert_unresolve(
                 println!(
                     "{}{}{}",
                     BranchStyles::CONFLICT,
-                    data.path.as_str(),
+                    display_path(data.path.as_str()),
                     anstyle::Reset
                 );
 
@@ -2174,11 +2177,7 @@ fn handle_revision_revert_unresolve(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_unresolve(
-        globals,
-        revert_unresolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_unresolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_restart(globals: LoreGlobalArgs, args: &RevisionRevertRestartArgs) -> u8 {
@@ -2197,11 +2196,7 @@ fn handle_revision_revert_restart(globals: LoreGlobalArgs, args: &RevisionRevert
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_restart(
-        globals,
-        revert_restart_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_restart_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_resolve(globals: LoreGlobalArgs, args: &RevisionRevertResolveArgs) -> u8 {
@@ -2234,6 +2229,7 @@ fn handle_revision_revert_resolve_impl(
     let revert_resolve_args = revision::LoreRevisionRevertResolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -2242,7 +2238,7 @@ fn handle_revision_revert_resolve_impl(
                 if count == 0 {
                     println!("Resolved conflicts:");
                 }
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
@@ -2260,11 +2256,7 @@ fn handle_revision_revert_resolve_impl(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_resolve(
-        globals,
-        revert_resolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_resolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_resolve_mine(
@@ -2286,11 +2278,7 @@ fn handle_revision_revert_resolve_mine(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_resolve_mine(
-        globals,
-        revert_resolve_mine_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_resolve_mine_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_resolve_theirs(
@@ -2312,11 +2300,7 @@ fn handle_revision_revert_resolve_theirs(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_resolve_theirs(
-        globals,
-        revert_resolve_theirs_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_resolve_theirs_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_metadata_clear(
@@ -2339,7 +2323,7 @@ pub fn handle_revision_metadata_clear(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::metadata_clear(globals, clear_args, callback)) as u8;
+    return run_command(globals, clear_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_metadata_get(globals: LoreGlobalArgs, args: &RevisionMetadataGetArgs) -> u8 {
@@ -2361,7 +2345,7 @@ pub fn handle_revision_metadata_get(globals: LoreGlobalArgs, args: &RevisionMeta
                 .with_defaults(),
         ));
 
-        return runtime().block_on(revision::metadata_get(globals, get_args, callback)) as u8;
+        return run_command(globals, get_args.into(), callback) as u8;
     } else {
         let list_args = LoreRevisionMetadataListArgs {
             revision: LoreString::from(&args.revision),
@@ -2379,7 +2363,7 @@ pub fn handle_revision_metadata_get(globals: LoreGlobalArgs, args: &RevisionMeta
                 .with_defaults(),
         ));
 
-        runtime().block_on(revision::metadata_list(globals, list_args, callback)) as u8
+        run_command(globals, list_args.into(), callback) as u8
     }
 }
 
@@ -2427,7 +2411,7 @@ pub fn handle_revision_metadata_set(globals: LoreGlobalArgs, args: &RevisionMeta
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::metadata_set(globals, set_args, callback)) as u8;
+    return run_command(globals, set_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_metadata_commands(
@@ -2522,6 +2506,7 @@ fn store_info_delta_data(
         let delta = RevisionEntryDelta {
             action: data.action_as_string_short().to_string(),
             path: data.path.to_string(),
+            from_path: data.from_path.to_string(),
             merged: data.merged_as_string_short().to_string(),
             metadata: None,
         };
@@ -2623,7 +2608,7 @@ fn resolve_revision_user_ids(
             _ => (),
         })));
 
-    let result = runtime().block_on(auth::resolve_user_info(globals, auth_args, callback)) as u8;
+    let result = run_command(globals, auth_args.into(), callback) as u8;
 
     // If there was an error resolving names, don't bother doing anything else
     if result != 0 {
@@ -2700,7 +2685,7 @@ fn fetch_branch_id_for_revision(globals: LoreGlobalArgs, revision: Hash) -> Opti
             _ => (),
         })));
 
-    let result = runtime().block_on(revision::info(globals, info_args, callback)) as u8;
+    let result = run_command(globals, info_args.into(), callback) as u8;
     if result != 0 {
         return None;
     }
@@ -2711,6 +2696,7 @@ fn fetch_branch_id_for_revision(globals: LoreGlobalArgs, revision: Hash) -> Opti
 fn fetch_branch_name(globals: LoreGlobalArgs, branch_id: Context) -> Option<String> {
     let info_args = LoreBranchInfoArgs {
         branch: LoreString::from(branch_id.to_string()),
+        link: LoreString::default(),
     };
 
     let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -2727,7 +2713,7 @@ fn fetch_branch_name(globals: LoreGlobalArgs, branch_id: Context) -> Option<Stri
             _ => (),
         })));
 
-    let result = runtime().block_on(branch::info(globals, info_args, callback)) as u8;
+    let result = run_command(globals, info_args.into(), callback) as u8;
     if result != 0 {
         return None;
     }

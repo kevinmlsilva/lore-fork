@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+from lore_parsers import parse_complete_json
 from lore_parsers import parse_jsonl
 
 from lore import Lore
@@ -214,7 +215,9 @@ def test_dependency_tag_remove(new_lore_repo):
     output = repo.file_dependency_list(
         "src/a.rs", tags=["build"], json=True, offline=True
     )
-    assert listed_paths(output) == {"src/b.rs"}, "Expected b.rs still tagged with 'build'"
+    assert listed_paths(output) == {"src/b.rs"}, (
+        "Expected b.rs still tagged with 'build'"
+    )
 
     # Remove remaining tags by removing the whole edge
     output = repo.file_dependency_remove(
@@ -272,18 +275,19 @@ def test_dependency_cycle_detection(new_lore_repo):
     create_files(repo, ["src/a.rs", "src/b.rs"])
 
     # Add A -> B (should succeed)
-    output = repo.file_dependency_add(
-        "src/a.rs", "src/b.rs", json=True, offline=True
-    )
+    output = repo.file_dependency_add("src/a.rs", "src/b.rs", json=True, offline=True)
     assert parse_add_result(output) == 1
 
     # Add B -> A (should fail with cycle detection)
     output = repo.file_dependency_add(
         "src/b.rs", "src/a.rs", check=False, json=True, offline=True
     )
-    # Error event should contain cycle-related message
-    errors = parse_jsonl(output, "error")
-    assert len(errors) > 0, f"Expected error event for cycle, got: {output}"
+    # The cycle is rejected: the operation completes with a non-zero status,
+    # carrying the failure detail on the complete event.
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected non-zero complete for cycle, got: {output}"
+    )
 
     # Add B -> A with --force (should succeed, bypassing cycle detection)
     output = repo.file_dependency_add(
@@ -345,8 +349,11 @@ def test_dependency_multiple_sources_with_tags(new_lore_repo):
         "src/main.rs", "src/server.rs", tags=["runtime"], json=True, offline=True
     )
     repo.file_dependency_add(
-        "src/main.rs", "src/logging.rs", tags=["runtime", "debug"],
-        json=True, offline=True,
+        "src/main.rs",
+        "src/logging.rs",
+        tags=["runtime", "debug"],
+        json=True,
+        offline=True,
     )
 
     # server.rs -> db.rs [runtime], auth.rs [runtime, security]
@@ -354,8 +361,11 @@ def test_dependency_multiple_sources_with_tags(new_lore_repo):
         "src/server.rs", "src/db.rs", tags=["runtime"], json=True, offline=True
     )
     repo.file_dependency_add(
-        "src/server.rs", "src/auth.rs", tags=["runtime", "security"],
-        json=True, offline=True,
+        "src/server.rs",
+        "src/auth.rs",
+        tags=["runtime", "security"],
+        json=True,
+        offline=True,
     )
 
     # Verify main.rs "runtime" deps
@@ -379,9 +389,7 @@ def test_dependency_multiple_sources_with_tags(new_lore_repo):
         "src/server.rs", tags=["security"], json=True, offline=True
     )
     paths = listed_paths(output)
-    assert paths == {"src/auth.rs"}, (
-        f"Expected security deps for server, got: {paths}"
-    )
+    assert paths == {"src/auth.rs"}, f"Expected security deps for server, got: {paths}"
 
     # Verify reverse: who depends on auth.rs?
     output = repo.file_dependency_list(
@@ -415,18 +423,14 @@ def test_dependency_list_at_revision(new_lore_repo):
         with repo.open_file(path, "w+") as f:
             f.write(f"// {path}\n")
     repo.stage(scan=True, offline=True)
-    repo.file_dependency_add(
-        "src/main.rs", "src/lib.rs", json=True, offline=True
-    )
+    repo.file_dependency_add("src/main.rs", "src/lib.rs", json=True, offline=True)
     repo.commit("Create files with lib dependency", offline=True)
 
     # Revision 2: add main.rs -> util.rs dependency (touch file to have a stageable change)
     with repo.open_file("src/main.rs", "w") as f:
         f.write("// src/main.rs v2\n")
     repo.stage(scan=True, offline=True)
-    repo.file_dependency_add(
-        "src/main.rs", "src/util.rs", json=True, offline=True
-    )
+    repo.file_dependency_add("src/main.rs", "src/util.rs", json=True, offline=True)
     repo.commit("Add util dependency", offline=True)
 
     # Current state should show both dependencies
@@ -441,6 +445,4 @@ def test_dependency_list_at_revision(new_lore_repo):
         "src/main.rs", revision="@1", json=True, offline=True
     )
     paths = listed_paths(output)
-    assert paths == {"src/lib.rs"}, (
-        f"Expected only lib.rs at @1, got: {paths}"
-    )
+    assert paths == {"src/lib.rs"}, f"Expected only lib.rs at @1, got: {paths}"

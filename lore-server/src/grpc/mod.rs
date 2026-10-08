@@ -4,6 +4,9 @@ use futures::FutureExt;
 pub mod admin_service;
 pub mod environment;
 pub mod environment_service;
+pub mod forwarded_repository;
+pub mod forwarded_requests;
+pub mod forwarded_revision;
 pub mod handlers;
 pub mod lock_service;
 pub mod notification_service;
@@ -16,7 +19,6 @@ pub mod storage;
 pub mod storage_service;
 pub mod thinclient;
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,11 +31,21 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_base::types::Hash;
+use lore_revision::branch::BranchError;
+use lore_revision::diff::DiffError;
+use lore_revision::find::FindError;
+use lore_revision::immutable::ImmutableError;
+use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
+use lore_revision::metadata::branch::BranchMetadataError;
+use lore_revision::metadata::repository::RepositoryMetadataError;
+use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
 use lore_revision::state::StateError;
+use lore_storage::StoreError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -41,6 +53,8 @@ pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
 pub use server::GrpcServerBuilder;
+pub use server::GrpcServiceSettings;
+pub use server::GrpcTimeouts;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
 use tokio::sync::mpsc::Sender;
@@ -54,8 +68,11 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourcePermission;
-use crate::auth::jwt::verify_authorization;
+use crate::auth::jwt::ResourceMatcher;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -197,15 +214,38 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
     }
 }
 
+/// Rebuild the interceptor-verified token from request extensions. `None`
+/// when no interceptor ran (no verifier configured) or when either half is
+/// missing.
+pub fn get_verified_token(extensions: &Extensions) -> Option<VerifiedToken<'_>> {
+    let claims = extensions.get::<AuthorizationToken>()?;
+    let raw = extensions.get::<RawToken>()?;
+    Some(VerifiedToken {
+        raw: &raw.0,
+        claims,
+    })
+}
+
+/// The cross-partition link-read check for a revision-graph traversal: may
+/// the caller behind `extensions` reach a partition a link points into?
+///
+/// Asked synchronously, potentially many times per request, so it consults
+/// [`RepositoryAuthorizer::check_repository_access_sync`] with the verified
+/// token and denies when the authorizer cannot answer without I/O. The
+/// partition-access layer's `PartitionGrants` extension does not apply: it
+/// answers for the request's own partition, and a link points elsewhere.
 pub fn link_read_authorizer(
-    authorization: Option<AuthorizationToken>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
 ) -> lore_revision::state::CanReadRepository {
-    match authorization {
-        Some(token) => {
-            Arc::new(move |repository_id| verify_authorization(&token, repository_id).is_ok())
-        }
-        None => lore_revision::state::allow_all_repositories(),
-    }
+    let authorizer = authorizer.clone();
+    let token = get_verified_token(extensions).map(|token| token.owned());
+    Arc::new(move |repository_id| {
+        let token = token.as_ref().map(VerifiedTokenOwned::as_token);
+        authorizer
+            .check_repository_access_sync(token.as_ref(), repository_id, None)
+            .is_some_and(|verdict| verdict.is_ok())
+    })
 }
 
 pub fn get_user_id(extensions: &Extensions) -> String {
@@ -237,8 +277,13 @@ pub(crate) fn metadata_to_attribute(
     let attr_map = AttributeMap::default();
     attr_map.insert(repository);
 
+    // Both halves of the verified token, so a handler working from the
+    // attribute map (copy's source check) can rebuild a `VerifiedToken`.
     if let Ok(token) = get_authorization(extensions) {
         attr_map.insert(token);
+    }
+    if let Some(raw) = extensions.get::<RawToken>() {
+        attr_map.insert(raw.clone());
     }
 
     Ok(attr_map)
@@ -290,52 +335,12 @@ pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool
 }
 
 pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    has_required_permission(extensions, repository, "migrate")
-}
-
-pub fn get_matching_permissions(
-    extensions: &Extensions,
-    repository: RepositoryId,
-) -> Vec<ResourcePermission> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    let repository_to_match = format!("urc-{repository}");
-
-    user_resources
-        .into_iter()
-        .filter(|resource| resource.matches_repository(&repository_to_match))
-        .collect()
-}
-
-pub fn has_required_permission(
-    extensions: &Extensions,
-    repository_to_check: RepositoryId,
-    permission_to_check: &str,
-) -> bool {
-    get_matching_permissions(extensions, repository_to_check)
-        .into_iter()
-        .any(|resource_permission| {
-            resource_permission
-                .permission
-                .contains(&permission_to_check.to_string())
-        })
+    user_permissions(extensions, repository).contains(&"migrate".to_string())
 }
 
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
     let user_resources = resources_from_token(get_authorization(extensions).ok());
-    for resource in user_resources {
-        let resource_repository = resource
-            .resource_id
-            .strip_prefix("urc-")
-            .unwrap_or_default();
-        let resource_repository: RepositoryId = Context::from_str(resource_repository)
-            .unwrap_or_default()
-            .into();
-        if resource_repository == repository {
-            return resource.permission;
-        }
-    }
-
-    Vec::new()
+    ResourceMatcher::default().merged_permissions(&user_resources, repository)
 }
 
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {
@@ -343,6 +348,14 @@ pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> 
         Some(val) => val.to_str().map(|s| s.to_string()).ok(),
         None => None,
     }
+}
+
+pub fn extract_authorization_header<B>(request: &tonic::Request<B>) -> Option<String> {
+    request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 pub fn rpc_code_to_str(code: &Code) -> &'static str {
@@ -432,6 +445,18 @@ pub fn hook_error_to_status(error: HookError) -> Status {
     }
 }
 
+pub fn no_repository_access_status() -> Status {
+    Status::permission_denied("Unauthorized")
+}
+
+/// What an authorization check answers with when its own bound elapses,
+/// wherever that check is made. A server condition rather than a denial, and
+/// worded apart from a handler timeout so that which of the two elapsed stays
+/// legible in logs and metrics.
+pub fn authorization_timeout_status() -> Status {
+    Status::cancelled("Authorization timeout exceeded")
+}
+
 pub fn timeout_grpc<T>(
     duration: Duration,
     fut: impl Future<Output = Result<T, Status>>,
@@ -445,409 +470,81 @@ pub trait FilterSlowDownExt<T, E> {
     fn filter_slow_down(self) -> Result<Result<T, E>, Status>;
 }
 
-impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
-    fn filter_slow_down(self) -> Result<Result<T, StateError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
+/// Implements [`FilterSlowDownExt`] for error sets that declare a `SlowDown`
+/// variant: the backpressure signal becomes `RESOURCE_EXHAUSTED`, and every
+/// other outcome passes through for the caller to match on.
+macro_rules! impl_filter_slow_down {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl<T> FilterSlowDownExt<T, $error> for Result<T, $error> {
+                fn filter_slow_down(self) -> Result<Result<T, $error>, Status> {
+                    if let Err(err) = &self
+                        && err.is_slow_down()
+                    {
+                        return Err(Status::resource_exhausted(err.to_string()));
+                    }
+                    Ok(self)
+                }
+            }
+        )+
+    };
+}
+
+impl_filter_slow_down!(
+    BranchError,
+    BranchMetadataError,
+    DiffError,
+    FindError,
+    ImmutableError,
+    LinkError,
+    MetadataError,
+    RepositoryError,
+    RepositoryMetadataError,
+    StateError,
+    StoreError,
+);
+
+/// Converts a failed result into `Ok(None)` when `discard` accepts the error,
+/// and into a [`Status`] otherwise.
+///
+/// The failing path routes through [`FilterSlowDownExt::filter_slow_down`]
+/// first, so an error that carries its own status keeps it and only the
+/// remainder is reported as internal. A caller that can act on `None` keeps
+/// that path without also discarding the errors it cannot act on.
+pub fn none_or_status<T, E>(
+    result: Result<T, E>,
+    discard: impl FnOnce(&E) -> bool,
+) -> Result<Option<T>, Status>
+where
+    Result<T, E>: FilterSlowDownExt<T, E>,
+    E: std::error::Error,
+{
+    match result.filter_slow_down()? {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if discard(&err) => Ok(None),
+        Err(err) => Err(warn_error_to_status(&err, |err| {
+            Status::internal(err.to_string())
+        })),
     }
 }
 
-impl<T> FilterSlowDownExt<T, MetadataError> for Result<T, MetadataError> {
-    fn filter_slow_down(self) -> Result<Result<T, MetadataError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn get_authorization_extracts_auth() {
-        let mut extensions = Extensions::new();
-        let test_authz_token = AuthorizationToken::default();
-        extensions.insert(test_authz_token.clone());
-
-        let authz_data = get_authorization(&extensions).ok().unwrap();
-        assert_eq!(authz_data, test_authz_token);
+/// Reads a revision hash out of a request's `signature` field, refusing a
+/// signature that is not a whole one.
+///
+/// A partial hash signature is a request the server cannot act on rather than a
+/// revision it looked for and did not find, so it is refused as
+/// `FAILED_PRECONDITION`: retrying it unchanged fails the same way.
+///
+/// An empty field is not a partial signature but an unset one, and is left to
+/// the zero hash its callers already handle.
+pub fn revision_signature(signature: Bytes) -> Result<Hash, Status> {
+    if !signature.is_empty() && signature.len() != size_of::<Hash>() {
+        return Err(Status::failed_precondition(format!(
+            "partial revision hash signature of {} byte(s) - give the whole {} byte signature, or a branch and revision number",
+            signature.len(),
+            size_of::<Hash>(),
+        )));
     }
 
-    #[test]
-    fn get_matching_permissions_includes_matched_repo_permissions() {
-        let mut extensions = Extensions::new();
-        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-        let mut test_authz_token = AuthorizationToken::default();
-
-        let test_resource_permission = ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["test_permission".to_string()],
-        };
-
-        test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-        extensions.insert(test_authz_token.clone());
-
-        let test_repository_context: RepositoryId =
-            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let test_unrelated_repository_context: RepositoryId =
-            Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let matched_resources = get_matching_permissions(&extensions, test_repository_context);
-        let no_matched_resources =
-            get_matching_permissions(&extensions, test_unrelated_repository_context);
-        assert_eq!(matched_resources, vec![test_resource_permission]);
-        assert_eq!(no_matched_resources, vec![]);
-    }
-
-    #[test]
-    fn get_matching_permissions_includes_wildcard_resource() {
-        let mut extensions = Extensions::new();
-        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-        let mut test_authz_token = AuthorizationToken::default();
-
-        let test_resource_permission = ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["test_permission".to_string()],
-        };
-        let test_wildcard_resource_permission = ResourcePermission {
-            resource_id: "urc-*".to_string().clone(),
-            permission: vec!["test_wildcard_permission".to_string()],
-        };
-
-        test_authz_token.resources = Some(vec![
-            test_resource_permission.clone(),
-            test_wildcard_resource_permission.clone(),
-        ]);
-        extensions.insert(test_authz_token.clone());
-
-        let test_repository_context: RepositoryId =
-            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let test_unrelated_repository_context: RepositoryId =
-            Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let matched_resources = get_matching_permissions(&extensions, test_repository_context);
-        let no_matched_resources =
-            get_matching_permissions(&extensions, test_unrelated_repository_context);
-        assert_eq!(
-            matched_resources,
-            vec![
-                test_resource_permission,
-                test_wildcard_resource_permission.clone()
-            ]
-        );
-        assert_eq!(
-            no_matched_resources,
-            vec![test_wildcard_resource_permission]
-        );
-    }
-
-    #[test]
-    fn finds_existing_matching_permission_with_regular_repo() {
-        let mut extensions = Extensions::new();
-        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-        let mut test_authz_token = AuthorizationToken::default();
-
-        let test_resource_permission = ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec![
-                "test_permission".to_string(),
-                "other_permission".to_string(),
-            ],
-        };
-
-        test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-        extensions.insert(test_authz_token.clone());
-
-        let test_repository_context: RepositoryId =
-            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let test_unrelated_repository_context: RepositoryId =
-            Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-
-        // user has test_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission"
-        ));
-        // user has other_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "other_permission"
-        ));
-        // user doesn't have test_permission2 for a given repo in their token
-        assert!(!has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission2"
-        ),);
-        // user doesn't have test_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "test_permission"
-        ),);
-        // user doesn't have other_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "other_permission"
-        ));
-    }
-
-    #[test]
-    fn finds_existing_matching_permission_with_wildcard_repo() {
-        let mut extensions = Extensions::new();
-        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-        let mut test_authz_token = AuthorizationToken::default();
-
-        let test_resource_permission = ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec![
-                "test_permission".to_string(),
-                "unique_permission".to_string(),
-            ],
-        };
-        let test_wildcard_resource_permission = ResourcePermission {
-            resource_id: "urc-*".to_string().clone(),
-            permission: vec![
-                "test_permission".to_string(),
-                "test_wildcard_permission".to_string(),
-                "another_wildcard_permission".to_string(),
-            ],
-        };
-
-        test_authz_token.resources = Some(vec![
-            test_resource_permission.clone(),
-            test_wildcard_resource_permission.clone(),
-        ]);
-        extensions.insert(test_authz_token.clone());
-
-        let test_repository_context: RepositoryId =
-            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let test_unrelated_repository_context: RepositoryId =
-            Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-
-        // user has test_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission"
-        ));
-        // user has unique_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "unique_permission"
-        ));
-        // user has test_wildcard_permission for a given repo — through the wildcard resource
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_wildcard_permission"
-        ));
-        // user also has test_permission for an unrelated repository — through the wildcard resource
-        assert!(has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "test_permission"
-        ));
-
-        // user doesn't have unique_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "unique_permission"
-        ));
-    }
-
-    #[test]
-    fn can_admin_lock_with_direct_permission_claim() {
-        let mut extensions = Extensions::new();
-        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-        let mut test_authz_token = AuthorizationToken::default();
-
-        let test_resource_permission = ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["test_permission".to_string(), "migrate".to_string()],
-        };
-
-        test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-        extensions.insert(test_authz_token.clone());
-
-        let test_repository_context: RepositoryId =
-            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let test_unrelated_repository_context: RepositoryId =
-            Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-
-        // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
-
-        // as user doesn't have "migrate" permission for an unrelated repo, they CAN'T admin lock that repo
-        assert!(!can_admin_lock(
-            &extensions,
-            test_unrelated_repository_context
-        ));
-    }
-
-    #[test]
-    fn can_admin_lock_with_wildcard_permission_claim() {
-        let mut extensions = Extensions::new();
-        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-        let mut test_authz_token = AuthorizationToken::default();
-
-        let test_resource_permission = ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["test_permission".to_string(), "migrate".to_string()],
-        };
-
-        let test_wildcard_resource_permission = ResourcePermission {
-            resource_id: "urc-*".to_string().clone(),
-            permission: vec![
-                "migrate".to_string(),
-                "test_wildcard_permission".to_string(),
-            ],
-        };
-
-        test_authz_token.resources = Some(vec![
-            test_resource_permission.clone(),
-            test_wildcard_resource_permission.clone(),
-        ]);
-        extensions.insert(test_authz_token.clone());
-
-        let test_repository_context: RepositoryId =
-            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        let test_unrelated_repository_context: RepositoryId =
-            Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-
-        // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
-
-        // user doesn't have direct "migrate" permission for an unrelated repo
-        // but they have a wildcard token with "migrate", so they should be able to admin lock arbitrary repo
-        assert!(can_admin_lock(
-            &extensions,
-            test_unrelated_repository_context
-        ));
-    }
-
-    mod timeout_grpc_tests {
-        use std::time::Duration;
-
-        use super::*;
-
-        #[tokio::test]
-        async fn returns_ok_when_future_succeeds_within_timeout() {
-            let fut = async { Ok::<_, Status>(42) };
-            let result = timeout_grpc(Duration::from_secs(1), fut).await;
-            assert_eq!(result.unwrap(), 42);
-        }
-
-        #[tokio::test]
-        async fn preserves_original_error_when_future_fails_within_timeout() {
-            let fut = async { Err::<i32, _>(Status::not_found("missing")) };
-            let result = timeout_grpc(Duration::from_secs(1), fut).await;
-            let status = result.unwrap_err();
-            assert_eq!(status.code(), Code::NotFound);
-            assert_eq!(status.message(), "missing");
-        }
-
-        #[tokio::test]
-        async fn returns_cancelled_when_future_exceeds_timeout() {
-            let fut = async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok::<_, Status>(42)
-            };
-            let result = timeout_grpc(Duration::from_millis(10), fut).await;
-            let status = result.unwrap_err();
-            assert_eq!(status.code(), Code::Cancelled);
-            assert!(status.message().contains("timeout"));
-        }
-    }
-
-    mod filter_slow_down_tests {
-        use lore_base::error::SlowDown;
-
-        use super::*;
-
-        #[test]
-        fn state_ok_passes_through() {
-            let result: Result<i32, StateError> = Ok(42);
-            let filtered = result.filter_slow_down().unwrap();
-            assert_eq!(filtered.unwrap(), 42);
-        }
-
-        #[test]
-        fn state_slow_down_returns_resource_exhausted() {
-            let result: Result<i32, StateError> = Err(StateError::from(SlowDown));
-            let status = result.filter_slow_down().unwrap_err();
-            assert_eq!(status.code(), Code::ResourceExhausted);
-        }
-
-        #[test]
-        fn state_error_passes_through() {
-            let result: Result<i32, StateError> = Err(StateError::internal("other error"));
-            let filtered = result.filter_slow_down().unwrap();
-            let underlying_error = filtered.expect_err("Should be err");
-            assert!(!underlying_error.is_slow_down());
-        }
-
-        #[test]
-        fn metadata_ok_passes_through() {
-            let result: Result<i32, MetadataError> = Ok(42);
-            let filtered = result.filter_slow_down().unwrap();
-            assert_eq!(filtered.unwrap(), 42);
-        }
-
-        #[test]
-        fn metadata_slow_down_returns_resource_exhausted() {
-            let result: Result<i32, MetadataError> = Err(MetadataError::from(SlowDown));
-            let status = result.filter_slow_down().unwrap_err();
-            assert_eq!(status.code(), Code::ResourceExhausted);
-        }
-
-        #[test]
-        fn metadata_error_passes_through() {
-            let result: Result<i32, MetadataError> = Err(MetadataError::internal("other error"));
-            let filtered = result.filter_slow_down().unwrap();
-            let underlying_error = filtered.expect_err("Should be err");
-            assert!(!underlying_error.is_slow_down());
-        }
-    }
+    Ok(Hash::from(signature))
 }

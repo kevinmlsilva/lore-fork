@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod registry;
+
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -7,13 +9,13 @@ use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::error::LoreErrorExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
-use crate::global;
 use crate::global::GlobalConfig;
-use crate::global::save_config;
+use crate::global::GlobalConfigError;
+use crate::global::get_global_data_dir;
+use crate::instance::InstanceId;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -24,11 +26,14 @@ use crate::protocol;
 use crate::repository::RepositoryConfig;
 use crate::repository::SharedStoreToUseConfig;
 use crate::repository::StoreConfig;
+use crate::shared_store::registry::SharedStoreRegistry;
 use crate::store::immutable;
 use crate::store::immutable::ImmutableStoreCreateOptions;
 use crate::store::immutable::ImmutableStoreSettings;
 use crate::store::mutable;
 use crate::util;
+use crate::util::config;
+use crate::util::config::SaveableConfig;
 use crate::util::url::normalize_remote_url;
 
 #[error_set]
@@ -71,6 +76,51 @@ pub struct SharedStoreConfig {
 pub const SHARED_STORE_DIR: &str = "shared_store";
 // Inside SHARED_STORE_DIR
 pub const SHARED_STORE_CONFIG: &str = "shared_store.toml";
+// Inside the global data directory, both the default location to put shared stores and the location
+// of the shared store registry.
+pub const SHARED_STORES_DIR: &str = "stores";
+
+/// The per-remote subdirectory name within a shared store base path. A base
+/// path holds one such directory per remote URL so a single base can back
+/// the stores of multiple endpoints at once.
+pub fn shared_store_subdir_for_remote(remote_url: &str) -> String {
+    escape_url_as_dirname(normalize_remote_url(remote_url))
+}
+
+fn escape_url_as_dirname(url: &str) -> String {
+    url.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_ascii_control() => '_',
+            c => c,
+        })
+        .collect()
+}
+
+pub fn suggested_shared_store_path_for_remote_url(
+    remote_url: &str,
+) -> Result<PathBuf, GlobalConfigError> {
+    let data_dir = get_global_data_dir()?;
+    let shared_store_dir = data_dir.join(SHARED_STORE_DIR);
+    let url_dirname = escape_url_as_dirname(normalize_remote_url(remote_url));
+    let new_path = shared_store_dir.join(&url_dirname);
+    if new_path.exists() {
+        return Ok(new_path);
+    }
+    // Fall back to legacy path that didn't include the SHARED_STORE_DIR
+    let legacy_path = data_dir.join(url_dirname);
+    if legacy_path.exists() {
+        return Ok(legacy_path);
+    }
+    // Fall back to legacy path that included the protocol prefix (e.g. "urcs___host")
+    // so existing shared stores created before protocol stripping are still found.
+    let legacy_path = data_dir.join(escape_url_as_dirname(remote_url.trim_end_matches('/')));
+    if legacy_path.exists() {
+        return Ok(legacy_path);
+    }
+    // No legacy path exists — use the new normalized form for new stores.
+    Ok(new_path)
+}
 
 pub fn find_existing_shared_store_in_dir(
     containing_dir_path: impl AsRef<Path>,
@@ -115,39 +165,46 @@ pub async fn create_shared_store(
         let identity = global_cli_args.identity().unwrap_or_default();
         protocol::connect(&remote_url, identity, RepositoryId::default())
             .await
-            .internal(&format!("Failed to connect to remote URL {remote_url}"))?;
+            .forward_with::<SharedStoreError, _>(|| {
+                format!("Failed to connect to remote URL {remote_url}")
+            })?;
     }
 
     let directory_containing_shared_store = if let Some(path) = path {
-        path.join(GlobalConfig::shared_store_subdir_for_remote(&remote_url))
+        path.join(shared_store_subdir_for_remote(&remote_url))
     } else {
-        GlobalConfig::suggested_path_for_remote_url(&remote_url)
-            .internal("failed to make default shared store path")?
+        suggested_shared_store_path_for_remote_url(&remote_url)
+            .forward::<SharedStoreError>("failed to make default shared store path")?
     };
     let shared_store_path = directory_containing_shared_store.join(SHARED_STORE_DIR);
 
     if shared_store_path.exists() {
         if global_cli_args.force() {
-            tokio::fs::remove_dir_all(&shared_store_path)
+            lore_io::IoDriver::global()
+                .remove_dir_all(&shared_store_path)
                 .await
                 .internal_with(|| {
                     format!("removing shared store at {}", shared_store_path.display())
                 })?;
         } else {
-            return SharedStoreError::internal(format!(
+            return Err(SharedStoreError::internal(format!(
                 "Found existing shared store at {}",
                 shared_store_path.display()
-            ))
-            .emit();
+            )));
         }
     }
 
-    create_shared_store_at(&shared_store_path, Some(remote_url.clone())).await?;
+    create_shared_store_at(
+        &directory_containing_shared_store,
+        &shared_store_path,
+        Some(remote_url.clone()),
+    )
+    .await?;
 
     if make_default {
         let (mut global_config, lock) = GlobalConfig::load_locked()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         global_config
             .set_default_path_for_remote_url(
                 &remote_url,
@@ -155,11 +212,11 @@ pub async fn create_shared_store(
                     .to_str()
                     .ok_or_else(|| SharedStoreError::internal("bad path"))?,
             )
-            .internal("setting default shared store path")?;
+            .forward::<SharedStoreError>("setting default shared store path")?;
         global_config
             .save(lock)
             .await
-            .internal("saving global config")?;
+            .forward::<SharedStoreError>("saving global config")?;
     }
 
     Ok(())
@@ -170,6 +227,7 @@ pub async fn create_shared_store(
 /// store. Shared by the explicit `shared-store create` command and the
 /// create-on-clone path in [`ensure_shared_store_for_repo`].
 async fn create_shared_store_at(
+    directory_containing_shared_store: &Path,
     shared_store_path: &Path,
     remote_url: Option<String>,
 ) -> Result<(), SharedStoreError> {
@@ -190,7 +248,6 @@ async fn create_shared_store_at(
         options,
         false,
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             verify_write: shared_store_config
                 .store_config
@@ -202,6 +259,8 @@ async fn create_shared_store_at(
     )
     .await
     .forward::<SharedStoreError>("creating immutable store")?;
+
+    lore_storage::maintenance::spawn_gc(&immutable_store, &options);
 
     mutable::create(
         Some(shared_store_path),
@@ -216,12 +275,26 @@ async fn create_shared_store_at(
     })
     .send();
 
-    save_config(
+    config::save(
         &shared_store_config,
         &shared_store_path.join(SHARED_STORE_CONFIG),
     )
     .await
-    .internal("saving shared store config")?;
+    .forward::<SharedStoreError>("saving shared store config")?;
+
+    let (mut registry, lock) = SharedStoreRegistry::load_locked()
+        .await
+        .forward::<SharedStoreError>("Loading registry to write")?;
+    registry
+        .register(
+            shared_store_config.remote_url.unwrap_or_default(),
+            directory_containing_shared_store,
+        )
+        .forward::<SharedStoreError>("Adding shared store to registry")?;
+    registry
+        .save(lock)
+        .await
+        .forward::<SharedStoreError>("Saving shared store registry")?;
 
     Ok(())
 }
@@ -251,7 +324,7 @@ async fn resolve_shared_store_dir(
     if let Some(path) = &shared_store_to_use_config.shared_store_path {
         let base = util::path::make_absolute(path)
             .forward::<SharedStoreError>("resolving shared store path")?;
-        Ok(base.join(GlobalConfig::shared_store_subdir_for_remote(
+        Ok(base.join(shared_store_subdir_for_remote(
             remote_url
                 .as_ref()
                 .ok_or(SharedStoreError::internal("no remote url"))?,
@@ -259,14 +332,14 @@ async fn resolve_shared_store_dir(
     } else {
         let global_config = GlobalConfig::load()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         Ok(global_config
             .default_shared_store_directory_for_remote(
                 remote_url
                     .as_ref()
                     .ok_or(SharedStoreError::internal("no remote url"))?,
             )
-            .internal("getting shared store path")?)
+            .forward::<SharedStoreError>("getting shared store path")?)
     }
 }
 
@@ -290,13 +363,13 @@ async fn migrate_legacy_store_in_base(
     }
 
     if let Some(parent) = target_store_path.parent() {
-        tokio::fs::create_dir_all(parent)
+        lore_io::IoDriver::global()
+            .create_dir_all(parent)
             .await
             .internal_with(|| format!("creating shared store directory {}", parent.display()))?;
     }
-    #[allow(clippy::disallowed_methods)]
-    // Authorized shared-store writer (global data dir, not repo tree).
-    tokio::fs::rename(&legacy_store_path, target_store_path)
+    lore_io::IoDriver::global()
+        .rename(&legacy_store_path, target_store_path)
         .await
         .internal_with(|| {
             format!(
@@ -346,7 +419,12 @@ pub async fn ensure_shared_store_for_repo(
             config.remote_url.as_deref().unwrap_or_default(),
             shared_store_path.display()
         );
-        create_shared_store_at(&shared_store_path, config.remote_url.clone()).await?;
+        create_shared_store_at(
+            &directory_with_shared_store,
+            &shared_store_path,
+            config.remote_url.clone(),
+        )
+        .await?;
     }
 
     if shared_store_to_use_config.shared_store_path.is_none()
@@ -357,14 +435,14 @@ pub async fn ensure_shared_store_for_repo(
     {
         let (mut global_config, lock) = GlobalConfig::load_locked()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         global_config
             .set_default_path_for_remote_url(remote_url, directory)
-            .internal("setting default shared store path")?;
+            .forward::<SharedStoreError>("setting default shared store path")?;
         global_config
             .save(lock)
             .await
-            .internal("saving global config")?;
+            .forward::<SharedStoreError>("saving global config")?;
     }
 
     Ok(())
@@ -411,17 +489,17 @@ async fn load_shared_store_config(
     let config_path = shared_store_path.join(SHARED_STORE_CONFIG);
     let legacy_config_path = shared_store_path.join("global.toml");
     if config_path.exists() {
-        global::load_config::<SharedStoreConfig>(config_path)
+        config::load::<SharedStoreConfig>(config_path)
             .await
             .forward::<SharedStoreError>("Loading shared store config")
     } else if legacy_config_path.exists() {
         // If a config is found at the old location, save it to the correct location and delete the
         // original
-        let legacy_config = global::load_config::<SharedStoreConfig>(&legacy_config_path)
+        let legacy_config = config::load::<SharedStoreConfig>(&legacy_config_path)
             .await
             .forward::<SharedStoreError>("Loading legacy shared store config");
         if let Ok(legacy_config) = legacy_config.as_ref() {
-            save_config(legacy_config, config_path)
+            config::save(legacy_config, config_path)
                 .await
                 .forward::<SharedStoreError>("migrating global config")?;
             util::fs::unlink(&legacy_config_path)
@@ -450,4 +528,28 @@ pub struct LoreSharedStoreInfoEventData {
     pub paths: LoreArray<LoreString>,
     /// Per-store flag, nonzero when the store exists on disk.
     pub exists: LoreArray<u8>,
+}
+
+/// Data for an event describing all shared stores.
+#[repr(C)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreSharedStoreListEventData {
+    /// All stores from the registry.
+    pub stores: LoreArray<LoreSharedStoreListItem>,
+}
+
+/// Shared store array list item.
+#[repr(C)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreSharedStoreListItem {
+    /// Remote URL the shared store is for.
+    pub remote_url: LoreString,
+    /// Path to the shared store on disk.
+    pub store_path: LoreString,
+    /// Paths to instances using the shared store
+    pub instance_paths: LoreArray<LoreString>,
+    /// Ids of instances using the shared store
+    pub instance_ids: LoreArray<InstanceId>,
 }

@@ -24,15 +24,16 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::event::EventError;
+use lore_macro::ValidateText;
 use lore_revision::event::LoreEvent;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
+use lore_revision::repository::get_dot_lore_path;
 use lore_revision::store::event::LoreStorageOpenedEventData;
 use lore_revision::util::path::make_absolute;
 use lore_storage::MutableStore;
+use lore_storage::StorageError;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::create as create_immutable;
@@ -52,7 +53,7 @@ use crate::storage::store::StoreInternal;
 
 /// Remote endpoint configuration for a storage handle.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageRemoteConfig {
     /// gRPC endpoint of the peer storage service; authenticated with the open call's `globals.identity`
     pub remote_url: LoreString,
@@ -71,11 +72,21 @@ pub struct LoreStorageOpenArgs {
     pub remote_config: LoreStorageRemoteConfig,
     /// Activate `remote_config`; otherwise the handle has no remote
     pub has_remote_config: u8,
-    /// Soft cap on total immutable-store bytes (compactor target); honored only when `globals.gc`
-    /// is set. `0` selects the default; shared disk backends inherit the first opener's value
+    /// Skip re-hashing a loaded payload and checking it against the address it was read from.
+    ///
+    /// Zero keeps the check, which is the default: a store handing back bytes under a content
+    /// address should be able to say they are the bytes that address names. A caller whose own
+    /// layer already assures integrity - one that scrubs its store on a schedule, say - pays for
+    /// the check on every byte of every read and learns nothing new from it, and can set this.
+    ///
+    /// Applies to every read on the handle.
+    pub skip_verify: u8,
+    /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
+    /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
+    /// inherit the first opener's value
     pub cache_target_bytes: u64,
-    /// Soft cap on immutable-store fragment count (evictor target); honored only when `globals.gc`
-    /// is set. `0` selects the default
+    /// Soft cap on immutable-store fragment count (evictor target). A non-zero cache target enables
+    /// incremental background GC for the handle; `0` then selects the default
     pub cache_target_fragments: u64,
 }
 
@@ -88,7 +99,7 @@ pub struct LoreStorageOpenArgs {
 //   repository_path: LoreString { ptr, len }              → 16 bytes
 //   in_memory: u8 + 7-byte tail pad                       →  8 bytes
 //   remote_config: LoreStorageRemoteConfig { LoreString } → 16 bytes
-//   has_remote_config: u8 + 7-byte tail pad               →  8 bytes
+//   has_remote_config: u8, skip_verify: u8 + 6-byte pad   →  8 bytes
 //   cache_target_bytes: u64                               →  8 bytes
 //   cache_target_fragments: u64                           →  8 bytes
 //                                                  total  → 64 bytes
@@ -96,10 +107,12 @@ const _: () = assert!(std::mem::size_of::<LoreStorageOpenArgs>() == 64);
 
 /// Default soft cap on total bytes held in the immutable store when `gc=1` and the caller
 /// passes `cache_target_bytes = 0`.
+#[lore_macro::test_pub]
 const DEFAULT_CACHE_TARGET_BYTES: usize = 1 << 30;
 
 /// Default soft cap on fragment count when `gc=1` and the caller passes
 /// `cache_target_fragments = 0`.
+#[lore_macro::test_pub]
 const DEFAULT_CACHE_TARGET_FRAGMENTS: usize = 1 << 20;
 
 /// Internal floor the evictor enforces in `lore-storage`. Targets below this are silently
@@ -107,18 +120,19 @@ const DEFAULT_CACHE_TARGET_FRAGMENTS: usize = 1 << 20;
 /// unnoticed.
 const EVICTOR_MIN_CAPACITY: usize = 1 << 20;
 
-/// Build the `ImmutableStoreCreateOptions` for a handle from `globals.gc` and the caller's
-/// cache targets. With `gc_enabled = false` the result is `none()` — no evictor or compactor
-/// spawn, regardless of the cache target values. With `gc_enabled = true`, a `0` target field
-/// resolves to the built-in default; a non-zero target below the evictor's internal floor
-/// (`EVICTOR_MIN_CAPACITY`) is passed through but logged at `warn` so the caller knows the
-/// effective cap is the floor, not the value they asked for.
+/// Build the `ImmutableStoreCreateOptions` for a handle from the caller's cache targets.
+/// Incremental background GC (evictor + compactor) is opt-in per handle: with both targets
+/// `0` the result is `none()` — no evictor or compactor spawn. When either target is non-zero,
+/// GC is enabled and a `0` field resolves to the built-in default; a non-zero
+/// `cache_target_fragments` below the evictor's internal floor (`EVICTOR_MIN_CAPACITY`) is
+/// passed through but logged at `warn` so the caller knows the effective cap is the floor, not
+/// the value they asked for.
+#[lore_macro::test_pub]
 fn build_create_options(
-    gc_enabled: bool,
     cache_target_bytes: u64,
     cache_target_fragments: u64,
 ) -> ImmutableStoreCreateOptions {
-    if !gc_enabled {
+    if cache_target_bytes == 0 && cache_target_fragments == 0 {
         return ImmutableStoreCreateOptions::none();
     }
     let max_size = if cache_target_bytes == 0 {
@@ -144,30 +158,12 @@ fn build_create_options(
     }
 }
 
-#[error_set]
-enum OpenError {
-    InvalidArguments,
-}
-
-impl EventError for OpenError {
-    fn translated(&self) -> LoreError {
-        match self {
-            OpenError::InvalidArguments(_) => LoreError::InvalidArguments,
-            OpenError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Acquire a handle to a content-addressed store.
 ///
 /// On success the caller receives `LORE_EVENT_STORAGE_OPENED` carrying
-/// `{handle}` before `Complete {status: 0}`. On failure, one
-/// `LORE_EVENT_ERROR` fires followed by `Complete {status: 1}` and no
-/// `STORAGE_OPENED`.
+/// `{handle}` before `Complete` with `status` `0`. On failure, no
+/// `STORAGE_OPENED` and no `LORE_EVENT_ERROR` fire; `Complete` carries the
+/// error code in `status` and the full detail in its `error` field.
 pub async fn open(
     globals: LoreGlobalArgs,
     args: LoreStorageOpenArgs,
@@ -176,11 +172,11 @@ pub async fn open(
     dispatch_call(globals, args, callback, open_local).await
 }
 
-async fn open_local(
+fn open_local(
     globals: LoreGlobalArgs,
     args: LoreStorageOpenArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     no_repository_call(globals, callback, args, open, async move |args| {
         let path = args.repository_path.as_str();
         let in_memory = args.in_memory != 0;
@@ -189,16 +185,15 @@ async fn open_local(
         // Bound `remote=1` without a `remote_config` produces a silently-broken handle —
         // every read misses local then finds no remote. Reject up front.
         if bound_flags.remote && args.has_remote_config == 0 {
-            return Err(OpenError::from(InvalidArguments {
+            return Err(StorageError::from(InvalidArguments {
                 reason: "`globals.remote=1` requires `has_remote_config != 0`".into(),
             }));
         }
-        let gc_enabled = execution_context().globals().gc();
-        let create_options = build_create_options(
-            gc_enabled,
-            args.cache_target_bytes,
-            args.cache_target_fragments,
-        );
+        let create_options = if execution_context().globals().no_gc() {
+            ImmutableStoreCreateOptions::none()
+        } else {
+            build_create_options(args.cache_target_bytes, args.cache_target_fragments)
+        };
 
         let identity = execution_context()
             .globals()
@@ -215,7 +210,8 @@ async fn open_local(
                     ImmutableStoreSettings::default(),
                 )
                 .await
-                .internal("creating in-memory immutable store")?;
+                .forward_any::<StorageError>("creating in-memory immutable store")?;
+                lore_storage::maintenance::spawn_gc(&immutable, &create_options);
                 let mutable: Arc<dyn MutableStore> = Arc::new(
                     LocalMutableStore::new(
                         Option::<&std::path::Path>::None,
@@ -223,7 +219,7 @@ async fn open_local(
                         immutable.clone(),
                     )
                     .await
-                    .internal("creating in-memory mutable store")?,
+                    .forward::<StorageError>("creating in-memory mutable store")?,
                 );
                 (immutable, mutable)
             }
@@ -231,22 +227,28 @@ async fn open_local(
                 // Canonicalize for cache-key consistency, but fall back to the raw path on
                 // canonicalize failure so the dotpath check below surfaces the real error.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
-                let dot_dir = repository::RepositoryFormat::detect(&absolute).dot_dir();
-                let dotpath = absolute.join(dot_dir);
+                let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
+                    StorageError::from(InvalidArguments {
+                        reason: format!(
+                            "unable to find .lore directory for repository at {}",
+                            absolute.display(),
+                        ),
+                    })
+                })?;
                 // Without this guard, `load_repository_config` would return defaults and
                 // `LocalImmutableStore` would create the directory tree, silently fabricating
                 // a fresh repo on any path.
                 if !dotpath.is_dir() {
-                    return Err(OpenError::from(InvalidArguments {
+                    return Err(StorageError::from(InvalidArguments {
                         reason: format!(
                             "no lore repository at {} (missing {})",
                             absolute.display(),
-                            dot_dir
+                            dotpath.display()
                         ),
                     }));
                 }
                 let config = repository::load_repository_config(&absolute)
-                    .internal("loading repository config")?;
+                    .forward_any::<StorageError>("loading repository config")?;
                 let immutable = repository::create_client_immutable_store(
                     &config,
                     &dotpath,
@@ -254,15 +256,15 @@ async fn open_local(
                     false,
                 )
                 .await
-                .internal("opening immutable store")?;
+                .forward_any::<StorageError>("opening immutable store")?;
                 let mutable: Arc<dyn MutableStore> =
                     repository::create_client_mutable_store(&config, &dotpath, immutable.clone())
                         .await
-                        .internal("opening mutable store")?;
+                        .forward_any::<StorageError>("opening mutable store")?;
                 (immutable, mutable)
             }
             _ => {
-                return Err(OpenError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "`repository_path` non-empty requires `in_memory == 0`; \
                              `repository_path` empty requires `in_memory == 1`"
                         .into(),
@@ -273,7 +275,7 @@ async fn open_local(
         let remote = if args.has_remote_config != 0 {
             let url = args.remote_config.remote_url.as_str();
             if url.is_empty() {
-                return Err(OpenError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "`remote_config.remote_url` must be non-empty when \
                              `has_remote_config != 0`"
                         .into(),
@@ -295,91 +297,13 @@ async fn open_local(
             mutable,
             remote,
             bound_flags,
+            args.skip_verify != 0,
         ));
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {
             handle_id: handle.handle_id,
         })
         .send();
-        Ok::<(), OpenError>(())
+        Ok::<(), StorageError>(())
     })
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gc_disabled_yields_no_evictor_or_compactor() {
-        let options = build_create_options(false, 1024, 8);
-        assert!(options.max_capacity.is_none());
-        assert!(options.max_size.is_none());
-    }
-
-    #[test]
-    fn gc_enabled_with_zero_targets_falls_back_to_defaults() {
-        let options = build_create_options(true, 0, 0);
-        assert_eq!(options.max_size, Some(DEFAULT_CACHE_TARGET_BYTES));
-        assert_eq!(options.max_capacity, Some(DEFAULT_CACHE_TARGET_FRAGMENTS));
-    }
-
-    #[test]
-    fn gc_enabled_with_explicit_targets_passes_them_through() {
-        let options = build_create_options(true, 512, 16);
-        assert_eq!(options.max_size, Some(512));
-        assert_eq!(options.max_capacity, Some(16));
-    }
-
-    #[test]
-    fn gc_enabled_with_one_zero_field_only_defaults_that_field() {
-        let bytes_only = build_create_options(true, 4096, 0);
-        assert_eq!(bytes_only.max_size, Some(4096));
-        assert_eq!(
-            bytes_only.max_capacity,
-            Some(DEFAULT_CACHE_TARGET_FRAGMENTS),
-        );
-        let frags_only = build_create_options(true, 0, 32);
-        assert_eq!(frags_only.max_size, Some(DEFAULT_CACHE_TARGET_BYTES));
-        assert_eq!(frags_only.max_capacity, Some(32));
-    }
-
-    /// Sub-floor `cache_target_fragments` must surface a warn-level log so the operator can
-    /// see the misconfiguration. This is the smallest behavioral observable proving the
-    /// target reaches the evictor wiring; deterministic eviction would require driving the
-    /// evictor's internal floor (`1 << 20` fragments), which is infeasible in a unit test.
-    /// The test installs a `fn`-pointer log callback that toggles a static flag when the
-    /// expected message lands.
-    #[test]
-    fn gc_enabled_below_floor_emits_warn() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering;
-
-        static SAW_WARN: AtomicBool = AtomicBool::new(false);
-
-        fn capture(level: lore_base::log::LoreLogLevel, _location: &str, message: &str) {
-            if level == lore_base::log::LoreLogLevel::Warn
-                && message.contains("below the evictor's internal floor")
-            {
-                SAW_WARN.store(true, Ordering::Release);
-            }
-        }
-
-        let prev_level = lore_base::log::log_level();
-        lore_base::log::set_log_level(lore_base::log::LoreLogLevel::Warn);
-        lore_base::log::set_log_callback(Some(capture));
-        SAW_WARN.store(false, Ordering::Release);
-
-        let options = build_create_options(true, 0, 4);
-
-        // Restore the previous logger state regardless of the assert outcome.
-        lore_base::log::set_log_callback(None);
-        lore_base::log::set_log_level(prev_level);
-
-        assert_eq!(options.max_capacity, Some(4));
-        assert!(
-            SAW_WARN.load(Ordering::Acquire),
-            "sub-floor cache_target_fragments must emit a warn log",
-        );
-    }
 }

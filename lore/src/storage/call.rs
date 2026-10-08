@@ -12,11 +12,12 @@ use std::time::Instant;
 
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
-use lore_revision::interface::LoreError;
+use lore_error_set::FfiError;
+use lore_error_set::HasTrace;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
+use lore_storage::StorageError;
 
 use crate::call::setup_execution;
 use crate::interface::LoreEventCallback;
@@ -26,32 +27,13 @@ use crate::storage::store::StoreInternal;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
-/// Errors emitted by the dispatch helper itself (not by the op impl).
-#[error_set]
-enum DispatchError {
-    InvalidArguments,
-}
-
-impl EventError for DispatchError {
-    fn translated(&self) -> LoreError {
-        match self {
-            DispatchError::InvalidArguments(_) => LoreError::InvalidArguments,
-            DispatchError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Run a storage-API op behind the in-flight counter protocol.
 ///
 /// The helper:
 /// 1. Sets up an `ExecutionContext` and enters its `LORE_CONTEXT` scope.
 /// 2. Acquires an [`OpGuard`] for the handle — if the handle is unknown
-///    or already closed, emits `LORE_EVENT_ERROR` + `Complete{status:1}`
-///    and returns `1` without invoking the op impl.
+///    or already closed, completes with the handle-miss error detail and
+///    returns its error code without invoking the op impl.
 /// 3. Passes a cloned `Arc<StoreInternal>` to the op impl (ownership
 ///    transferred; the impl can fan it out to spawned tasks).
 /// 4. Translates the impl's `Result` into a `Complete{status}` event.
@@ -64,6 +46,7 @@ impl EventError for DispatchError {
 /// before the returned future resolves — no background work outlives
 /// a data op. Use `JoinSet` / `join_all` to await spawned futures
 /// before returning.
+#[lore_macro::test_pub]
 pub(crate) async fn storage_call<Arg, T, F, Fut, ResT, ErrT>(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
@@ -73,7 +56,7 @@ pub(crate) async fn storage_call<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<StoreInternal>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -83,173 +66,27 @@ where
     LORE_CONTEXT
         .scope(execution, async move {
             let Some(guard) = OpGuard::enter(store_handle) else {
-                let err = DispatchError::from(InvalidArguments {
+                let err = StorageError::from(InvalidArguments {
                     reason: "storage handle is unknown or has been closed".into(),
                 });
-                execution_context().dispatcher.send_error(err);
-                execution_context().dispatcher.complete(1).await;
-                return 1;
+                return execution_context()
+                    .dispatcher
+                    .complete(LoreErrorDetail::from_error(&err))
+                    .await;
             };
 
             log_command_info(&caller, &args);
             let time_start = Instant::now();
 
             let store = guard.store_clone();
-            let status = match command(store, args).await {
-                Ok(_) => 0,
-                Err(err) => {
-                    execution_context().dispatcher.send_error(err);
-                    1
-                }
-            };
+            let detail = LoreErrorDetail::from_result(command(store, args).await);
 
             log_command_done(&caller, time_start);
-            execution_context().dispatcher.complete(status).await;
+            let status = execution_context().dispatcher.complete(detail).await;
             // Explicit drop after Complete: a closer waiting on the in-flight counter must
             // not be woken before Complete has fired.
             drop(guard);
             status
         })
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-
-    use lore_revision::event::LoreEvent;
-    use lore_revision::interface::LoreGlobalArgs;
-
-    use super::*;
-    use crate::storage::handle;
-    use crate::storage::store::StoreInternal;
-    use crate::storage::store::in_memory_for_tests;
-
-    /// Minimal record of an emitted event preserving the values tests
-    /// care about: discriminant for kind, and the `Complete.status` for
-    /// ordering/value assertions.
-    #[derive(Debug, Clone, PartialEq)]
-    enum CapturedEvent {
-        Error,
-        Complete(i32),
-        Other(u32),
-    }
-
-    impl CapturedEvent {
-        fn from_event(event: &LoreEvent) -> Self {
-            match event {
-                LoreEvent::Error(_) => Self::Error,
-                LoreEvent::Complete(data) => Self::Complete(data.status),
-                other => Self::Other(other.discriminant()),
-            }
-        }
-    }
-
-    fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-        Some(Box::new(move |event: &LoreEvent| {
-            sink.lock().unwrap().push(CapturedEvent::from_event(event));
-        }))
-    }
-
-    async fn register_test_store() -> (Arc<StoreInternal>, LoreStore) {
-        let store = in_memory_for_tests("call-test").await;
-        let store_handle = handle::register(store.clone());
-        (store, store_handle)
-    }
-
-    #[tokio::test]
-    async fn handle_miss_emits_error_and_completes_with_status_one() {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = storage_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            LoreStore::INVALID,
-            (),
-            "handle_miss_test",
-            |_store, _args: ()| async move { Ok::<_, DispatchError>(()) },
-        )
-        .await;
-        assert_eq!(status, 1);
-        let events = sink.lock().unwrap().clone();
-        assert!(
-            events.contains(&CapturedEvent::Error),
-            "missing Error event"
-        );
-        assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "Complete event must carry status=1 matching returned value, got {events:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn happy_path_completes_with_status_zero_and_decrements_counter() {
-        let (store, store_handle) = register_test_store().await;
-        assert_eq!(store.in_flight.load(Ordering::Acquire), 0);
-
-        let invoked = Arc::new(AtomicU64::new(0));
-        let invoked_clone = invoked.clone();
-
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = storage_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            store_handle,
-            (),
-            "happy_path_test",
-            move |store_arc, _args: ()| async move {
-                invoked_clone.fetch_add(1, Ordering::AcqRel);
-                assert!(store_arc.in_flight.load(Ordering::Acquire) >= 1);
-                Ok::<_, DispatchError>(())
-            },
-        )
-        .await;
-
-        assert_eq!(status, 0);
-        assert_eq!(invoked.load(Ordering::Acquire), 1);
-        assert_eq!(
-            store.in_flight.load(Ordering::Acquire),
-            0,
-            "counter must return to zero after the op"
-        );
-        let events = sink.lock().unwrap().clone();
-        assert!(
-            events.contains(&CapturedEvent::Complete(0)),
-            "Complete event must carry status=0 matching returned value, got {events:?}"
-        );
-        handle::unregister(store_handle);
-    }
-
-    #[tokio::test]
-    async fn op_error_emits_error_and_completes_with_status_one() {
-        let (store, store_handle) = register_test_store().await;
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = storage_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            store_handle,
-            (),
-            "op_error_test",
-            move |_store, _args: ()| async move {
-                Err::<(), _>(DispatchError::from(InvalidArguments {
-                    reason: "simulated op error".into(),
-                }))
-            },
-        )
-        .await;
-        assert_eq!(status, 1);
-        assert_eq!(
-            store.in_flight.load(Ordering::Acquire),
-            0,
-            "counter must return to zero even on error"
-        );
-        let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&CapturedEvent::Error));
-        assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "Complete event must carry status=1 matching returned value, got {events:?}"
-        );
-        handle::unregister(store_handle);
-    }
 }

@@ -14,12 +14,11 @@ use lore_proto::lore::thin_client::v1::revision_tree_request;
 use lore_revision::branch;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
+use lore_revision::link::LinkPinChange;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::revision;
-use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
@@ -80,22 +79,25 @@ impl From<revision_diff_request::QueryTo> for RevisionSpec {
 ///
 /// Signature queries pass through; identifier queries with `number == 0`
 /// resolve to the branch's latest revision via `branch::load_latest`;
-/// non-zero numbers resolve via `revision::resolve("branch@N")`. The
-/// `is_not_found` / non-not-found split routes user-input misses to
-/// `Status::not_found` (quiet) and server-side faults to
-/// `Status::internal` (with structured warn).
+/// non-zero numbers resolve through the step acceleration structures,
+/// falling back to a full history walk. The `is_not_found` / non-not-found
+/// split routes user-input misses to `Status::not_found` (quiet) and
+/// server-side faults to `Status::internal` (with structured warn).
 pub(super) async fn resolve_signature(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Hash, Status> {
     match spec {
-        RevisionSpec::Signature(signature) => Ok(Hash::from(signature)),
+        RevisionSpec::Signature(signature) => crate::grpc::revision_signature(signature),
         RevisionSpec::Identifier(identifier) => {
             let branch_id = BranchId::from(&identifier.branch_id);
             if identifier.number == 0 {
                 debug!({BRANCH_ID} = %branch_id, "Resolving branch latest");
                 branch::load_latest(repository.clone(), branch_id)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         if err.is_branch_not_found() {
                             Status::not_found(format!("Branch {branch_id} not found"))
@@ -108,14 +110,15 @@ pub(super) async fn resolve_signature(
                         }
                     })
             } else {
-                let signature = format!("{branch_id}@{}", identifier.number);
-                revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
+                crate::cache::revision::resolve_revision_number(
+                    repository,
+                    branch_id,
+                    identifier.number,
+                    history_step_size,
+                    acceleration,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     if err.is_not_found() || err.is_revision_not_found() {
                         Status::not_found(format!(
@@ -146,8 +149,10 @@ pub(super) async fn resolve_signature(
 pub(super) async fn resolve_to_identifier(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<(Hash, model_v1::RevisionIdentifier), Status> {
-    let signature = resolve_signature(repository, spec).await?;
+    let signature = resolve_signature(repository, spec, history_step_size, acceleration).await?;
     debug!({REVISION} = %signature, "Loaded resolved signature");
     let identifier = identifier_for_signature(repository, signature).await?;
     Ok((signature, identifier))
@@ -185,6 +190,7 @@ pub(super) async fn identifier_for_signature(
     let metadata_hash = state.metadata_hash();
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
@@ -227,60 +233,88 @@ pub(super) fn node_flags_to_node_type(flags: NodeFlags) -> thin_client_v1::NodeT
 /// Maps internal `FileAction` to the v1 `Action` enum.
 fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
     match action {
-        FileAction::Keep => thin_client_v1::Action::Keep,
         FileAction::Add => thin_client_v1::Action::Add,
         FileAction::Delete => thin_client_v1::Action::Delete,
         FileAction::Move => thin_client_v1::Action::Move,
         FileAction::Copy => thin_client_v1::Action::Copy,
+        // A graft is internal to the merge walk, so this is unreachable on the
+        // diff paths. Report a modification rather than widen the wire enum.
+        FileAction::Keep | FileAction::Graft => thin_client_v1::Action::Keep,
     }
 }
 
 /// Convert an internal `NodeChange` into a v1 `DiffChange`. The
 /// `to.flags` drive `node_type` for non-delete actions; for deletes
 /// `from.flags` is the surviving record of what the path used to be.
-/// `content_from` / `content_to` carry the from / to side's CAS hash,
-/// or empty bytes for ADD (no from) and DELETE (no to).
-pub(super) fn node_change_to_diff_change(change: &NodeChange) -> thin_client_v1::DiffChange {
+///
+/// `link_repository_index` is passed through verbatim; the handler
+/// resolves it, since the per-stream partition table lives there.
+#[lore_macro::test_pub]
+pub(super) async fn node_change_to_diff_change(
+    change: &NodeChange,
+    link_repository_index: u32,
+) -> thin_client_v1::DiffChange {
     let action = file_action_to_v1_action(change.action);
     let node_type = match action {
         thin_client_v1::Action::Delete => node_flags_to_node_type(change.from.flags),
         _ => node_flags_to_node_type(change.to.flags),
     };
     let path_from = change
-        .from_path
-        .as_ref()
+        .move_source()
         .map(|p| p.to_string())
         .unwrap_or_default();
-    let content_from = if action == thin_client_v1::Action::Add {
-        Bytes::new()
-    } else {
-        change.from.address.hash.into()
-    };
-    let content_to = if action == thin_client_v1::Action::Delete {
-        Bytes::new()
-    } else {
-        change.to.address.hash.into()
-    };
+    let content_from = (action != thin_client_v1::Action::Add).then(|| change.from.address.into());
+    let content_to = (action != thin_client_v1::Action::Delete).then(|| change.to.address.into());
     thin_client_v1::DiffChange {
-        path: change.path.to_string(),
+        path: change.path().to_string(),
         path_from,
         action: action as i32,
         node_type: node_type as i32,
         content_from,
         content_to,
         automerged: change.flags.is_conflict_automerged(),
+        link_repository_index,
+        tracking: change.is_tracking_link().await,
+    }
+}
+
+/// A link's content is the revision it is pinned to, which lives in the
+/// linked repository rather than this one.
+#[lore_macro::test_pub]
+pub(super) fn link_pin_change_to_diff_change(
+    pin_change: &LinkPinChange,
+    link_repository_index: u32,
+) -> thin_client_v1::DiffChange {
+    let pinned_address = |revision: Hash| model_v1::Address {
+        hash: revision.into(),
+        context: pin_change.link_repository.into(),
+    };
+    thin_client_v1::DiffChange {
+        path: pin_change.link_path.clone(),
+        path_from: String::new(),
+        action: thin_client_v1::Action::Keep as i32,
+        node_type: thin_client_v1::NodeType::Link as i32,
+        content_from: Some(pinned_address(pin_change.revision_from)),
+        content_to: Some(pinned_address(pin_change.revision_to)),
+        automerged: false,
+        link_repository_index,
+        tracking: pin_change.tracking_to,
     }
 }
 
 /// Convert a 3-way merge conflict pair `(base→from, base→to)` into a
 /// v1 `DiffConflict`. The pair's `from.address` on both halves is the
 /// common-ancestor content for that path, so `change_from.content_from
-/// == change_to.content_from` per the proto contract.
-pub(super) fn diff_conflict_from_pair(
+/// == change_to.content_from` per the proto contract. The two halves
+/// take separate indices: they can land in different partitions.
+#[lore_macro::test_pub]
+pub(super) async fn diff_conflict_from_pair(
     pair: &(NodeChange, NodeChange),
+    link_repository_index_from: u32,
+    link_repository_index_to: u32,
 ) -> thin_client_v1::DiffConflict {
     thin_client_v1::DiffConflict {
-        change_from: Some(node_change_to_diff_change(&pair.0)),
-        change_to: Some(node_change_to_diff_change(&pair.1)),
+        change_from: Some(node_change_to_diff_change(&pair.0, link_repository_index_from).await),
+        change_to: Some(node_change_to_diff_change(&pair.1, link_repository_index_to).await),
     }
 }

@@ -11,7 +11,6 @@ use crate::event;
 use crate::lore::Address;
 use crate::repository::RepositoryContext;
 use crate::state;
-use crate::store::StoreMatch;
 use crate::util::path::RelativePath;
 
 /// Data for the event reporting the stored representation of file content.
@@ -81,7 +80,10 @@ pub enum DumpError {
 
 impl crate::event::EventError for DumpError {}
 
-pub async fn dump_file(repository: Arc<RepositoryContext>, path: String) -> Result<(), DumpError> {
+pub(crate) async fn dump_file(
+    repository: Arc<RepositoryContext>,
+    path: String,
+) -> Result<(), DumpError> {
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
         .forward::<DumpError>("invalid path")?;
 
@@ -117,13 +119,21 @@ pub async fn dump_file(repository: Arc<RepositoryContext>, path: String) -> Resu
     Ok(())
 }
 
-pub async fn dump_address(
+/// Boxed version of [`dump_file`] for cross-crate use.
+pub fn dump_file_boxed(
+    repository: Arc<RepositoryContext>,
+    path: String,
+) -> crate::BoxFuture<'static, Result<(), DumpError>> {
+    Box::pin(dump_file(repository, path))
+}
+
+pub(crate) async fn dump_address(
     repository: Arc<RepositoryContext>,
     address: Address,
 ) -> Result<(), DumpError> {
     let result = repository
         .immutable_store()
-        .query(repository.id, address, StoreMatch::MatchFull)
+        .get_metadata(repository.id, address)
         .await
         .forward::<DumpError>("querying fragment from immutable store")?;
 
@@ -137,4 +147,12 @@ pub async fn dump_address(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`dump_address`] for cross-crate use.
+pub fn dump_address_boxed(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+) -> crate::BoxFuture<'static, Result<(), DumpError>> {
+    Box::pin(dump_address(repository, address))
 }

@@ -11,7 +11,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
@@ -22,21 +21,117 @@ mod tests {
     use lore_revision::file::reset;
     use lore_revision::file::reset::ResetOptions;
     use lore_revision::filter::FilterMode;
+    use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
+    use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
     use lore_revision::repository::DOT_LOREIGNORE;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::load_filter;
     use lore_revision::stage::StageOptions;
     use lore_revision::state;
-    use lore_transport::ProtocolError;
+
+    /// The changes the working tree shows against `state`, reported without marking
+    /// anything, which is what these tests check a reset by.
+    async fn filesystem_changes(
+        repository: &Arc<repository::RepositoryContext>,
+        state: &Arc<state::State>,
+    ) -> Vec<lore_revision::change::NodeChange> {
+        let operation = repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("Failed to start filesystem operation");
+        let changes = state::diff_filesystem(
+            &operation,
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state.clone(),
+            },
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state.clone(),
+            },
+            None, /* No subpath */
+            FilterMode::Full,
+            FilesystemDiffIntent::Report,
+            Arc::new(Vec::new()),
+        )
+        .await
+        .expect("Failed to diff filesystem")
+        .collect()
+        .await
+        .expect("Failed to diff filesystem");
+        operation
+            .finalize()
+            .await
+            .expect("Failed to finish filesystem operation");
+        changes
+    }
 
     include!("helper.rs");
+
+    /// The repository's own directory is held nowhere, so a reset naming it, in any case and with
+    /// `--purge`, resets nothing and removes nothing. The path never reaches the walk that would
+    /// otherwise take a path the revision holds no node for as an untracked one and delete it.
+    #[tokio::test]
+    async fn reset_purge_of_the_control_directory_path_leaves_it_in_place() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let path = fixture.path.clone();
+
+                test_file_write(&path.join("kept.txt"), b"kept");
+                test_commit_tree(&fixture, "Initial").await;
+
+                let control = path.join(".lore");
+                assert!(
+                    control.join("id").is_file(),
+                    "the fixture's control directory holds the repository id"
+                );
+
+                for spelling in [".lore", ".LORE", ".Lore/id"] {
+                    reset::reset(
+                        repository.clone(),
+                        &fixture.write_token,
+                        LoreArray::from_vec(vec![LoreString::from(
+                            path.join(spelling).to_string_lossy().as_ref(),
+                        )]),
+                        LoreString::default(),
+                        ResetOptions {
+                            purge: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("a reset naming {spelling} must succeed, got {err}")
+                    });
+                    assert!(
+                        control.join("id").is_file(),
+                        "{spelling}: the reset removed the control directory"
+                    );
+                }
+                assert!(
+                    path.join("kept.txt").is_file(),
+                    "the content was left alone"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 
     fn create_file(path: &Path) -> File {
         let mut file = File::options()
@@ -93,14 +188,14 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        load_filter(&path).expect("Failed to load filter"),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id)
+                        .with_filter(load_filter(&path).expect("Failed to load filter")),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -170,10 +265,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Create a new directory
                 // - dir_added
@@ -191,11 +285,8 @@ mod tests {
 
                 // Rename a directory
                 // - dir_untouched -> dir_renamed
-                lore_storage::fs_util::rename_file(
-                    path.join("dir_untouched"),
-                    path.join("dir_renamed"),
-                )
-                .expect("Failed to rename dir_untouched directory");
+                std::fs::rename(path.join("dir_untouched"), path.join("dir_renamed"))
+                    .expect("Failed to rename dir_untouched directory");
 
                 // Modify a file
                 // - dir_modified/file_modified.txt
@@ -217,20 +308,20 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.as_path().to_path_buf()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        load_filter(&path).expect("Failed to load filter"),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(path.as_path())
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id)
+                        .with_filter(load_filter(&path).expect("Failed to load filter")),
                     )
                     .with_write_token(write_token.share()),
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -239,17 +330,7 @@ mod tests {
                     .expect("Failed to deserialize current state");
 
                 // Check the current filesystem status
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // Couple of changes are expected
                 assert!(!changes.is_empty());
@@ -257,6 +338,7 @@ mod tests {
                 // Reset all changes to the repository without purging
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions::default(),
@@ -265,17 +347,7 @@ mod tests {
                 .expect("Failed to reset changes");
 
                 // Check the current filesystem status again
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect four untracked changes
                 assert_eq!(changes.len(), 4);
@@ -289,6 +361,7 @@ mod tests {
                 // Reset all changes to the repository this time purging untracked files
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions {
@@ -300,17 +373,7 @@ mod tests {
                 .expect("Failed to reset changes");
 
                 // Check the current filesystem status again after reset with purging
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect the ignored file to still be changed (and extant)
                 let file_ignored_reset_contents =
@@ -341,6 +404,7 @@ mod tests {
                         force_context,
                         reset::reset(
                             repository.clone(),
+                            &write_token,
                             LoreArray::from_vec(vec![LoreString::from(&path)]),
                             LoreString::default(),
                             ResetOptions {
@@ -363,8 +427,6 @@ mod tests {
                         .expect("Could not check the existence of root_file_ignored.txt"),
                     "root_file_ignored.txt was not force purged."
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -399,14 +461,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -450,10 +511,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Modify a file
                 // - dir_modified/modified/inner/file_modified.txt
@@ -464,20 +524,19 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.as_path().to_path_buf()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(path.as_path())
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -486,17 +545,7 @@ mod tests {
                     .expect("Failed to deserialize current state");
 
                 // Check the current filesystem status
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // Couple of changes are expected
                 assert!(!changes.is_empty());
@@ -504,6 +553,7 @@ mod tests {
                 // Reset the modified file without purging
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions::default(),
@@ -512,22 +562,10 @@ mod tests {
                 .expect("Failed to reset changes");
 
                 // Check the current filesystem status again
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect no changes
                 assert_eq!(changes.len(), 0);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -562,14 +600,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -613,10 +650,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Modify a file
                 // - dir_modified/modified/inner/file_modified.txt
@@ -641,6 +677,7 @@ mod tests {
                 // Reset the modified file without purging, expect it to fail
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions::default(),
@@ -650,20 +687,19 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.as_path().to_path_buf()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(path.as_path())
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -672,22 +708,10 @@ mod tests {
                     .expect("Failed to deserialize current state");
 
                 // Check the current filesystem status
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect one change
                 assert_eq!(changes.len(), 1);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");

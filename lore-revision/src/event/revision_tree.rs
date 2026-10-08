@@ -12,6 +12,7 @@
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::RepositoryId;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -31,8 +32,9 @@ pub struct LoreRevisionTreeLoadedEventData {
 }
 
 /// Terminal per-call event for `resolve_path`. On success `error_code ==
-/// None` and `node_id` is the resolved node; on failure `node_id` is
-/// undefined and `error_code` is populated.
+/// None`, `node_id` is the resolved node, and `repository`/`revision` identify
+/// the tree it belongs to (they differ from the handle's when the path crosses
+/// a link). On failure `node_id` is undefined and `error_code` is populated.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +43,10 @@ pub struct LoreRevisionTreeResolvePathCompleteEventData {
     pub id: u64,
     /// The resolved node.
     pub node_id: NodeID,
+    /// Repository the resolved node belongs to.
+    pub repository: RepositoryId,
+    /// Revision the resolved node belongs to.
+    pub revision: Hash,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
@@ -62,6 +68,9 @@ pub struct LoreRevisionTreeChildEventData {
     pub parent_id: NodeID,
     /// The kind of node.
     pub kind: u32,
+    /// The change staged on the node, as a `LoreNodeStagedAction`. A child
+    /// staged for deletion is still listed, carrying the deletion here.
+    pub staged_action: u32,
     /// The file mode bits.
     pub mode: u16,
     /// The size of the node's content in bytes.
@@ -72,21 +81,23 @@ pub struct LoreRevisionTreeChildEventData {
     pub error_code: LoreErrorCode,
 }
 
-/// Root-only metadata accompanying `LoreRevisionTreeNodeInfoEventData` when
-/// the queried node is the revision root.
-///
-/// `is_root` is `1` when the inline fields carry data sourced from the
-/// Metadata fragment (parent revision signatures, creation timestamp,
-/// author identity, metadata key count); `0` for non-root nodes, in which
-/// case the inline fields are zero/default. Keeping the discriminator
-/// inline rather than wrapping in `Option<_>` keeps the struct
-/// `#[repr(C)]`-stable for cbindgen.
+/// Terminal per-call event for `revision_info` (the `lore_revision_tree_info`
+/// verb). Carries the loaded revision's record-level metadata: the parent
+/// revision signatures (from the State) plus the creation timestamp, author
+/// identity, and metadata key count (from the Metadata fragment), alongside the
+/// `(repository, revision)` the handle represents. On failure the fields are
+/// zeroed and `error_code` is populated. This is revision-scoped, not
+/// node-scoped — it takes no node id.
 #[repr(C)]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LoreRevisionTreeRootInfoData {
-    /// 1 when the inline fields carry root data; 0 otherwise.
-    pub is_root: u8,
+pub struct LoreRevisionTreeInfoEventData {
+    /// Correlation id of the originating call.
+    pub id: u64,
+    /// Repository the revision belongs to.
+    pub repository: RepositoryId,
+    /// The loaded revision.
+    pub revision: Hash,
     /// The parent revision signatures.
     pub parent: [Hash; 2],
     /// The time the revision was created.
@@ -95,26 +106,39 @@ pub struct LoreRevisionTreeRootInfoData {
     pub author_identity: LoreString,
     /// The number of metadata keys on the revision.
     pub metadata_key_count: u32,
+    /// The outcome of the call.
+    pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `node_info`. Carries the same per-node
-/// record as `list_children` plus the preserved `file_id` (the
-/// `address.context` slot of the node's original add) and, when the
-/// queried node is the root, the Metadata-fragment-derived `root_info`.
+/// Terminal per-call event for `node_info`. On success `error_code == None` and
+/// the per-node record matches `list_children` plus the preserved `file_id`
+/// (the `address.context` slot of the node's original add), with
+/// `repository`/`revision` identifying the tree the node belongs to (the
+/// handle's own — `node_info` does not follow links). The record is uniform
+/// across every node id, including the root; revision-level metadata is a
+/// separate concern served by `lore_revision_tree_info`. On failure the record
+/// is undefined and `error_code` is populated.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeNodeInfoEventData {
     /// Correlation id of the originating call.
     pub id: u64,
     /// The queried node.
     pub node_id: NodeID,
+    /// Repository the node belongs to.
+    pub repository: RepositoryId,
+    /// Revision the node belongs to.
+    pub revision: Hash,
     /// The name of the node.
     pub name: LoreString,
     /// The parent node.
     pub parent_id: NodeID,
     /// The kind of node.
     pub kind: u32,
+    /// The change staged on the node, as a `LoreNodeStagedAction`. A node
+    /// staged for deletion still reports, carrying the deletion here.
+    pub staged_action: u32,
     /// The file mode bits.
     pub mode: u16,
     /// The size of the node's content in bytes.
@@ -123,101 +147,149 @@ pub struct LoreRevisionTreeNodeInfoEventData {
     pub address: Address,
     /// The preserved file id of the node.
     pub file_id: Context,
-    /// Root metadata, valid only when the node is the revision root.
-    pub root_info: LoreRevisionTreeRootInfoData,
+    /// The outcome of the call.
+    pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `node_path`. On success `path` is the
-/// reconstructed UTF-8 path from the root to the queried node; on failure
-/// `path` is empty and `error_code` is populated.
+/// Terminal per-call event for `node_path`. On success `error_code == None` and
+/// `path` is the reconstructed UTF-8 path from the root to the queried node,
+/// with `repository`/`revision` identifying the tree it was reconstructed in
+/// (the handle's own — `node_path` walks within the handle's revision and does
+/// not follow links). On failure `path` is empty and `error_code` is populated.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeNodePathEventData {
     /// Correlation id of the originating call.
     pub id: u64,
+    /// Repository the path was reconstructed in.
+    pub repository: RepositoryId,
+    /// Revision the path was reconstructed in.
+    pub revision: Hash,
     /// The reconstructed path from the root to the queried node.
     pub path: LoreString,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `add`. On success `node_id` is the
-/// newly-allocated child; on failure `node_id` is undefined.
+/// Terminal event for a batch write call as a whole, carrying the `batch_id` the
+/// call was submitted under rather than any entry's `entry_id`.
+///
+/// Every batch write verb emits exactly one of these, after any per-entry
+/// terminals and before `Complete`. The error code is `NONE` when the call did
+/// what it was asked; otherwise it names a failure belonging to the call rather
+/// than to a single entry, such as an unknown or closed handle. A per-entry
+/// failure is reported on that entry's own terminal instead.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionTreeBatchCompleteEventData {
+    /// Correlation id the call was submitted under
+    pub batch_id: u64,
+    /// The outcome of the call as a whole
+    pub error_code: LoreErrorCode,
+}
+
+/// Terminal per-entry event for `add`. On success `node_id` is the
+/// newly-allocated child; on failure it is the invalid-node sentinel, since
+/// nothing was created. The call as a whole reports separately on
+/// `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeAddCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The newly-added node.
     pub node_id: NodeID,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `delete`.
+/// Terminal per-entry event for `delete`. The call as a whole reports
+/// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeDeleteCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
+    /// How many nodes the entry's subtree removed, staged and discarded
+    /// together. Zero on failure, since nothing was removed.
+    pub node_count: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `modify`. `node_id` echoes the modified
-/// node so the caller can chain operations without re-resolving.
+/// Terminal per-entry event for `modify`. On success `node_id` echoes the
+/// rewritten node so the caller can chain operations without re-resolving; on
+/// failure it is the invalid-node sentinel, since nothing was rewritten. The
+/// call as a whole reports separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeModifyCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The modified node.
     pub node_id: NodeID,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `move`. `node_id` echoes the moved node so
-/// the caller observes that `file_id` is preserved across the reparent.
+/// Terminal per-entry event for `move`. `node_id` echoes the moved node so
+/// the caller observes that `file_id` is preserved across the reparent. The
+/// call as a whole reports separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMoveCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The moved node.
     pub node_id: NodeID,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `metadata_set`.
+/// Terminal per-entry event for `metadata_set`. The call as a whole reports
+/// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataSetCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Per-call event carrying a metadata value from `metadata_get`. The
+/// Terminal per-entry event for `metadata_clear`. `removed` says whether the key
+/// was there to begin with: clearing an absent key is a no-op success, so the
+/// error code alone cannot tell the two apart. The call as a whole reports
+/// separately on `RevisionTreeBatchComplete`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionTreeMetadataClearCompleteEventData {
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
+    /// `1` when the key was present and has been removed, `0` when it was absent
+    /// and the entry was a no-op.
+    pub removed: u8,
+    /// The outcome of the call.
+    pub error_code: LoreErrorCode,
+}
+
+/// Per-entry event carrying a metadata value from `metadata_get`. The
 /// missing-key case emits no value event and lets the trailing `Complete`
 /// fire on its own.
-///
-/// No `Debug` derive: the embedded `LoreMetadata` enum does not implement
-/// `Debug`. Use `serde_json::to_string` to render this for diagnostics.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataGetCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The metadata key.
     pub key: LoreString,
     /// The metadata value.
@@ -227,10 +299,14 @@ pub struct LoreRevisionTreeMetadataGetCompleteEventData {
 }
 
 /// Terminal per-call event for `commit`. On success `revision_hash` is the
-/// newly-committed revision and `new_tip_hash` is `Hash::default()`. When
-/// `error_code` reports `BranchAdvanced`, `new_tip_hash` carries the
-/// observed branch tip so the caller can reload without an extra
-/// `branch::load_latest` round-trip.
+/// newly-committed revision and `new_tip_hash` is `Hash::default()`.
+///
+/// A non-zero `new_tip_hash` means the branch had advanced past the revision
+/// the handle was built on, and carries the tip to reload from so the caller
+/// needs no extra `branch::load_latest` round-trip. It is the only signal for
+/// that case: no `LoreErrorCode` value names a tip collision, so `error_code`
+/// reports `Internal` with the reason in the completion detail — the same code
+/// the file-system commit returns.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -252,6 +328,25 @@ pub struct LoreRevisionTreeCommitCompleteEventData {
 pub struct LoreRevisionTreeCloseCompleteEventData {
     /// Correlation id of the originating call.
     pub id: u64,
+    /// The outcome of the call.
+    pub error_code: LoreErrorCode,
+}
+
+/// Header for `list_children`, emitted once before any child event. Carries
+/// the `(repository, revision)` the listing targets — the handle's own tree,
+/// or a link target's tree after the link is resolved — so the caller can
+/// reopen that tree to act on the children's node ids. On failure carries the
+/// outcome with a zeroed `repository`/`revision` and no children follow.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionTreeListChildrenBeginEventData {
+    /// Correlation id of the originating call.
+    pub id: u64,
+    /// Repository the listed children belong to.
+    pub repository: RepositoryId,
+    /// Revision the listed children belong to.
+    pub revision: Hash,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
